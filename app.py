@@ -656,12 +656,12 @@ def process_floorplan_sync(file_url: str, job_id: str):
         # ============================================================
         
         # 🎨 QUALITY SETTINGS (Configurable via environment variables):
-        PDF_SCALE = float(os.environ.get('PDF_SCALE', '5.0'))  # 5.0=360 DPI (reduced for stability)
-        MAX_DIMENSION = int(os.environ.get('MAX_DIMENSION', '15000'))  # 15K pixels max (reduced)
+        PDF_SCALE = float(os.environ.get('PDF_SCALE', '15.0'))  # 15.0=1080 DPI (high quality)
+        MAX_DIMENSION = int(os.environ.get('MAX_DIMENSION', '30000'))  # 30K pixels max
         
         # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
         MAX_ZOOM_LIMIT = 15      # Maximum zoom levels allowed
-        FORCED_MAX_Z_ENV = int(os.environ.get('FORCED_MAX_Z', '5'))  # Max zoom level
+        FORCED_MAX_Z_ENV = int(os.environ.get('FORCED_MAX_Z', '-1'))  # -1 = auto-calculate based on image size
         TILE_SIZE_ENV = int(os.environ.get('TILE_SIZE', '512'))  # 512px tiles
         MIN_ZOOM_ENV = int(os.environ.get('MIN_ZOOM', '0'))  # Start from zoom level 0
         
@@ -726,17 +726,41 @@ def process_floorplan_sync(file_url: str, job_id: str):
         floor_plan_image = trim_whitespace(floor_plan_image, bg_color=(255, 255, 255), tolerance=10, padding=20)
         logger.info(f"Floor plan dimensions (post-trim): {floor_plan_image.width}x{floor_plan_image.height} pixels")
         
-        # 2. Set zoom levels for Leaflet tiles
-        FORCED_MAX_Z = max(0, min(FORCED_MAX_Z_ENV, MAX_ZOOM_LIMIT))
-        max_zoom = FORCED_MAX_Z
+        # 2. Calculate optimal zoom levels for Leaflet tiles
+        tile_size = TILE_SIZE_ENV
+        
+        # Calculate optimal max zoom based on image dimensions
+        # Goal: At max zoom, we want roughly 1-4 tiles per dimension (perfect native resolution)
+        if FORCED_MAX_Z_ENV == -1:
+            # Auto-calculate: Find zoom level where image fits in ~2-8 tiles per dimension
+            max_dim = max(floor_plan_image.width, floor_plan_image.height)
+            
+            # Calculate tiles needed at zoom 0 (1 tile covers entire image)
+            # At each zoom level, tiles double: zoom 0 = 1 tile, zoom 1 = 2 tiles, zoom 2 = 4 tiles, etc.
+            # We want: tile_size * (2^zoom) ≈ max_dim
+            # So: 2^zoom ≈ max_dim / tile_size
+            # zoom ≈ log2(max_dim / tile_size)
+            
+            optimal_zoom = math.ceil(math.log2(max_dim / tile_size))
+            max_zoom = max(0, min(optimal_zoom, MAX_ZOOM_LIMIT))
+            
+            logger.info(
+                f"🎯 Auto-calculated max zoom: {max_zoom} "
+                f"(image {floor_plan_image.width}x{floor_plan_image.height}, "
+                f"max_dim={max_dim}, tiles_at_max_zoom≈{math.ceil(max_dim/(tile_size*2**max_zoom))})"
+            )
+        else:
+            # Use forced max zoom from environment
+            max_zoom = max(0, min(FORCED_MAX_Z_ENV, MAX_ZOOM_LIMIT))
+            logger.info(f"Using forced max zoom: {max_zoom}")
+        
         min_zoom = max(0, min(MIN_ZOOM_ENV, max_zoom))
         total_levels = (max_zoom - min_zoom + 1)
         logger.info(f"Using Leaflet zoom levels: {min_zoom}-{max_zoom} (total {total_levels})")
 
         # Log native tile density at highest zoom
-        tile_size = TILE_SIZE_ENV
-        native_tiles_x = math.ceil(floor_plan_image.width / tile_size)
-        native_tiles_y = math.ceil(floor_plan_image.height / tile_size)
+        native_tiles_x = math.ceil(floor_plan_image.width / (tile_size * 2**(max_zoom)))
+        native_tiles_y = math.ceil(floor_plan_image.height / (tile_size * 2**(max_zoom)))
         native_total_tiles = native_tiles_x * native_tiles_y
         logger.info(
             "Max-zoom native tile grid: "
