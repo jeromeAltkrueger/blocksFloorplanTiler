@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import logging
 import pypdfium2 as pdfium
+from pdf2image import convert_from_bytes
 from PIL import Image, ImageChops
 from typing import List, Tuple, Dict, Optional
 import io
@@ -38,7 +39,7 @@ class ProcessFloorplanRequest(BaseModel):
 
 def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 20000) -> List[Image.Image]:
     """
-    Convert PDF bytes to a list of PIL Image objects using pypdfium2.
+    Convert PDF bytes to a list of PIL Image objects using pdf2image.
     Optimized for large single-page floor plans with extreme aspect ratios.
     
     Args:
@@ -57,51 +58,31 @@ def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 2
     try:
         logger.info(f"Starting PDF conversion at scale {scale}x")
         
-        # Load PDF from bytes
-        pdf = pdfium.PdfDocument(pdf_content)
-        logger.info(f"PDF loaded: {len(pdf)} page(s)")
+        # Calculate DPI from scale (72 DPI is default for PDFs)
+        dpi = int(scale * 72)
         
-        images = []
+        # Convert PDF to images using pdf2image
+        images = convert_from_bytes(pdf_content, dpi=dpi, fmt='png')
+        logger.info(f"PDF loaded: {len(images)} page(s)")
         
-        for page_index in range(len(pdf)):
-            page = pdf[page_index]
-            
-            # Get page dimensions
-            width = page.get_width()
-            height = page.get_height()
-            
-            # Calculate target dimensions
-            target_width = int(width * scale)
-            target_height = int(height * scale)
-            
-            # Check if dimensions are too large
-            if target_width > max_dimension or target_height > max_dimension:
-                logger.warning(f"Page {page_index + 1} dimensions too large ({target_width}x{target_height}), reducing scale")
+        # Check if any image exceeds max_dimension and resize if needed
+        processed_images = []
+        for page_index, img in enumerate(images):
+            if img.width > max_dimension or img.height > max_dimension:
+                logger.warning(f"Page {page_index + 1} dimensions too large ({img.width}x{img.height}), resizing")
                 
-                # Calculate reduced scale to fit within max_dimension
-                scale_factor = max_dimension / max(target_width, target_height)
-                new_scale = scale * scale_factor
+                # Calculate scale to fit within max_dimension
+                scale_factor = max_dimension / max(img.width, img.height)
+                new_width = int(img.width * scale_factor)
+                new_height = int(img.height * scale_factor)
                 
-                target_width = int(width * new_scale)
-                target_height = int(height * new_scale)
-                
-                logger.info(f"Adjusted scale to {new_scale:.2f}x, new dimensions: {target_width}x{target_height}")
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                logger.info(f"Resized to {new_width}x{new_height}")
             
-            # Render page to PIL Image
-            actual_scale = scale if target_width <= max_dimension and target_height <= max_dimension else new_scale
-            pil_image = page.render(
-                scale=actual_scale,
-                rotation=0,
-                crop=(0, 0, 0, 0)
-            ).to_pil()
-            
-            images.append(pil_image)
-            
-            logger.info(f"Page {page_index + 1}: {pil_image.width}x{pil_image.height} pixels, aspect ratio: {pil_image.width/pil_image.height:.2f}:1")
+            processed_images.append(img)
+            logger.info(f"Page {page_index + 1}: {img.width}x{img.height} pixels, aspect ratio: {img.width/img.height:.2f}:1")
         
-        pdf.close()
-        
-        return images
+        return processed_images
     
     except Exception as e:
         logger.error(f"Error converting PDF to images: {str(e)}")
