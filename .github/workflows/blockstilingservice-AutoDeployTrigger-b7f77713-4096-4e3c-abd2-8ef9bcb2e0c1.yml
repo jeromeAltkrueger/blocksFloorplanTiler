@@ -36,14 +36,9 @@ jobs:
           az containerapp up \
             --name blockstilingservice \
             --resource-group KompassExperimental \
+            --environment schemabuilder \
             --source . \
             --ingress external \
             --target-port 8000
-          
-          az containerapp update \
-            --name blockstilingservice \
-            --resource-group KompassExperimental \
-            --cpu 4 \
-            --memory 8Gi
 
 
