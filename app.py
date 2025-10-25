@@ -51,6 +51,8 @@ app = FastAPI(
 # Request model
 class ProcessFloorplanRequest(BaseModel):
     file_url: str
+    entity_id: Optional[int] = None
+    entity: Optional[str] = None
 
 
 def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 20000) -> List[Image.Image]:
@@ -309,7 +311,7 @@ def trim_whitespace(
         return image
 
 
-def create_metadata(image: Image.Image, max_zoom: int, floorplan_id: str, tile_size: int, min_zoom: int = 0, zoom_levels: List[int] = None) -> dict:
+def create_metadata(image: Image.Image, max_zoom: int, floorplan_id: str, tile_size: int, min_zoom: int = 0, zoom_levels: List[int] = None, entity_id: Optional[int] = None, entity: Optional[str] = None) -> dict:
     """
     Generate metadata for Web Mercator tile consumption.
     
@@ -320,6 +322,8 @@ def create_metadata(image: Image.Image, max_zoom: int, floorplan_id: str, tile_s
         tile_size: Size of tiles in pixels
         min_zoom: Minimum zoom level
         zoom_levels: List of actual zoom levels generated
+        entity_id: Optional entity ID
+        entity: Optional entity name
     
     Returns:
         Metadata dictionary compatible with Web Mercator tiling
@@ -330,6 +334,8 @@ def create_metadata(image: Image.Image, max_zoom: int, floorplan_id: str, tile_s
     
     return {
         "floorplan_id": floorplan_id,
+        "entity_id": entity_id,
+        "entity": entity,
         "source_image": {
             "width": image.width,
             "height": image.height,
@@ -514,7 +520,7 @@ def update_job_progress(job_id: str, progress: int, message: str):
             jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
 
 
-def process_floorplan_background(job_id: str, file_url: str):
+def process_floorplan_background(job_id: str, file_url: str, entity_id: Optional[int] = None, entity: Optional[str] = None):
     """Background task to process the floorplan"""
     try:
         # Update status to processing
@@ -523,7 +529,7 @@ def process_floorplan_background(job_id: str, file_url: str):
             jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
         
         # Call the synchronous processing logic
-        result = process_floorplan_sync(file_url, job_id)
+        result = process_floorplan_sync(file_url, job_id, entity_id, entity)
         
         # Mark as completed
         with jobs_lock:
@@ -572,7 +578,7 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
         }
     
     # Start background processing
-    background_tasks.add_task(process_floorplan_background, job_id, request.file_url)
+    background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.entity_id, request.entity)
     
     logger.info(f"Job {job_id} queued for processing")
     
@@ -584,7 +590,7 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
     }
 
 
-def process_floorplan_sync(file_url: str, job_id: str):
+def process_floorplan_sync(file_url: str, job_id: str, entity_id: Optional[int] = None, entity: Optional[str] = None):
     """
     Synchronous processing logic (moved from original async endpoint).
     Updates job progress throughout processing.
@@ -592,6 +598,8 @@ def process_floorplan_sync(file_url: str, job_id: str):
     Args:
         file_url: URL of the PDF to process
         job_id: Job ID for progress tracking
+        entity_id: Optional entity ID
+        entity: Optional entity name
         
     Returns:
         Result dictionary with floorplan info
@@ -645,8 +653,71 @@ def process_floorplan_sync(file_url: str, job_id: str):
         if not floorplan_name.lower().endswith('.pdf'):
             floorplan_name = 'floorplan.pdf'
         
-        # Extract floorplan ID from filename (remove .pdf extension)
-        floorplan_id = floorplan_name.rsplit('.', 1)[0]
+        # Extract base name from filename (remove .pdf extension)
+        base_name = floorplan_name.rsplit('.', 1)[0]
+        
+        # Create floorplan ID with entity information if provided
+        if entity and entity_id is not None:
+            floorplan_id = f"{entity}-{entity_id}-{base_name}"
+        else:
+            floorplan_id = base_name
+        
+        # Check if floorplan already exists
+        connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        if not connection_string:
+            raise HTTPException(
+                status_code=500,
+                detail="Storage connection string not configured"
+            )
+        
+        blob_service = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service.get_container_client("blocks")
+        
+        # If entity and entity_id are provided, check for existing folders with matching pattern
+        if entity and entity_id is not None:
+            # Find and delete any existing folders that match {entity}-{entity_id}-*
+            prefix = f"floorplans/{entity}-{entity_id}-"
+            logger.info(f"Checking for existing floorplans with prefix: {prefix}")
+            
+            existing_blobs = container_client.list_blobs(name_starts_with=prefix)
+            blobs_to_delete = []
+            
+            for blob in existing_blobs:
+                blobs_to_delete.append(blob.name)
+            
+            if blobs_to_delete:
+                logger.info(f"Found {len(blobs_to_delete)} existing blobs to delete for {entity}-{entity_id}")
+                for blob_name in blobs_to_delete:
+                    try:
+                        container_client.delete_blob(blob_name)
+                        logger.info(f"Deleted: {blob_name}")
+                    except Exception as del_err:
+                        logger.warning(f"Failed to delete {blob_name}: {del_err}")
+                logger.info(f"✅ Cleaned up existing floorplan data for {entity}-{entity_id}")
+            else:
+                logger.info(f"No existing floorplans found for {entity}-{entity_id}")
+        else:
+            # Check if exact floorplan already exists (no entity info provided)
+            metadata_blob_name = f"floorplans/{floorplan_id}/metadata.json"
+            metadata_blob_client = container_client.get_blob_client(metadata_blob_name)
+            
+            try:
+                # Try to get blob properties - if it exists, this will succeed
+                metadata_blob_client.get_blob_properties()
+                logger.info(f"Floorplan already exists: {floorplan_id}")
+                return {
+                    "success": True,
+                    "message": "Floorplan already exists",
+                    "floorplan_id": floorplan_id,
+                    "urls": {
+                        "metadata": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/metadata.json",
+                        "preview": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/preview.jpg",
+                        "tiles": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
+                    }
+                }
+            except Exception:
+                # Blob doesn't exist, continue with processing
+                logger.info(f"Floorplan does not exist, proceeding with processing: {floorplan_id}")
         
         # Create a mock blob name for compatibility
         myblob_name = f"blocks/{floorplan_name}"
@@ -656,7 +727,7 @@ def process_floorplan_sync(file_url: str, job_id: str):
         # ============================================================
         
         # 🎨 QUALITY SETTINGS (Configurable via environment variables):
-        PDF_SCALE = float(os.environ.get('PDF_SCALE', '50.0'))  # 50.0=3600 DPI (ultra-extreme quality for deep zoom)
+        PDF_SCALE = float(os.environ.get('PDF_SCALE', '40.0'))  # 40.0=2880 DPI (extreme quality for deep zoom)
         MAX_DIMENSION = int(os.environ.get('MAX_DIMENSION', '30000'))  # 30K pixels max
         
         # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
@@ -668,7 +739,7 @@ def process_floorplan_sync(file_url: str, job_id: str):
         
         # ✅ Deep zoom with upscaling beyond native resolution
         # For PDF_SCALE=15: Native res at zoom ~6-7, upscales for 8-10
-        # For PDF_SCALE=50: Native res at zoom ~8-9, upscales for 10-12
+        # For PDF_SCALE=40: Native res at zoom ~8-9, upscales for 10-12
         # ============================================================
         
         # Check if the file is a PDF
@@ -731,44 +802,29 @@ def process_floorplan_sync(file_url: str, job_id: str):
         tile_size = TILE_SIZE_ENV
         
         # Calculate optimal max zoom based on image dimensions
-        # Goal: Efficient tile distribution - zoom 0 should show full image in ~1-2 tiles
+        # Goal: At max zoom, we want roughly 1-4 tiles per dimension (perfect native resolution)
         if FORCED_MAX_Z_ENV == -1:
-            # Smart calculation: Work backwards from zoom 0 constraint
-            # At zoom 0, we want the entire image to fit in roughly 1-2 tiles per dimension
-            # Simple CRS scaling: At zoom Z, scale = 2^(Z - max_zoom)
-            # At zoom 0: scaled_size = original_size * 2^(0 - max_zoom) = original_size / (2^max_zoom)
-            # We want: scaled_size ≈ tile_size (so it fits in ~1 tile at zoom 0)
-            # So: original_size / (2^max_zoom) ≈ tile_size
-            # Therefore: 2^max_zoom ≈ original_size / tile_size
-            # max_zoom ≈ log2(original_size / tile_size)
-            
+            # Auto-calculate: Find zoom level where image fits in ~2-8 tiles per dimension
             max_dim = max(floor_plan_image.width, floor_plan_image.height)
             
-            # Calculate zoom where image naturally fits tile grid (no 1-tile waste)
-            # This gives us the zoom level where the image is shown at native resolution
-            base_zoom = math.ceil(math.log2(max_dim / tile_size))
+            # Calculate tiles needed at zoom 0 (1 tile covers entire image)
+            # At each zoom level, tiles double: zoom 0 = 1 tile, zoom 1 = 2 tiles, zoom 2 = 4 tiles, etc.
+            # We want: tile_size * (2^zoom) ≈ max_dim
+            # So: 2^zoom ≈ max_dim / tile_size
+            # zoom ≈ log2(max_dim / tile_size)
             
-            # Apply ZOOM_BOOST only if it doesn't create wasteful low-zoom levels
-            # Check if adding boost would make zoom 0 show image < tile_size (1 tile only)
-            min_dimension_at_zoom_0 = min(floor_plan_image.width, floor_plan_image.height) / (2 ** (base_zoom + ZOOM_BOOST))
+            optimal_zoom = math.ceil(math.log2(max_dim / tile_size))
             
-            if min_dimension_at_zoom_0 < tile_size / 2:
-                # Would create 1-tile zoom levels - reduce boost
-                adjusted_boost = max(0, math.floor(math.log2(min(floor_plan_image.width, floor_plan_image.height) / (tile_size / 2))))
-                max_zoom = max(0, min(base_zoom + adjusted_boost, MAX_ZOOM_LIMIT))
-                logger.info(
-                    f"🎯 Auto-calculated max zoom: {max_zoom} "
-                    f"(base: {base_zoom}, boost adjusted: {adjusted_boost} to avoid 1-tile waste, "
-                    f"image {floor_plan_image.width}x{floor_plan_image.height})"
-                )
-            else:
-                # Boost is safe - won't create 1-tile levels
-                max_zoom = max(0, min(base_zoom + ZOOM_BOOST, MAX_ZOOM_LIMIT))
-                logger.info(
-                    f"🎯 Auto-calculated max zoom: {max_zoom} "
-                    f"(base: {base_zoom}, boost: +{ZOOM_BOOST}, "
-                    f"image {floor_plan_image.width}x{floor_plan_image.height})"
-                )
+            # Add ZOOM_BOOST extra levels for deeper zoom with upscaling
+            boosted_zoom = optimal_zoom + ZOOM_BOOST
+            max_zoom = max(0, min(boosted_zoom, MAX_ZOOM_LIMIT))
+            
+            logger.info(
+                f"🎯 Auto-calculated max zoom: {max_zoom} "
+                f"(native optimal: {optimal_zoom}, boost: +{ZOOM_BOOST}, "
+                f"image {floor_plan_image.width}x{floor_plan_image.height}, "
+                f"max_dim={max_dim})"
+            )
         else:
             # Use forced max zoom from environment
             max_zoom = max(0, min(FORCED_MAX_Z_ENV, MAX_ZOOM_LIMIT))
@@ -812,7 +868,9 @@ def process_floorplan_sync(file_url: str, job_id: str):
             floorplan_id, 
             tile_size=tile_size, 
             min_zoom=min_zoom,
-            zoom_levels=zoom_levels
+            zoom_levels=zoom_levels,
+            entity_id=entity_id,
+            entity=entity
         )
         metadata["total_tiles"] = total_tiles
         metadata["quality_settings"] = {
@@ -823,13 +881,6 @@ def process_floorplan_sync(file_url: str, job_id: str):
         logger.info(f"Created metadata for floor plan: {floorplan_id}")
         
         # 6. Upload to blob storage
-        connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        if not connection_string:
-            raise HTTPException(
-                status_code=500,
-                detail="Storage connection string not configured"
-            )
-        
         logger.info("Uploading tiles and assets to blob storage...")
         upload_tiles_to_blob(
             pyramid=pyramid,
