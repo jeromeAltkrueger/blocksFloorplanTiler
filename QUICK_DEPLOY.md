@@ -23,7 +23,7 @@ az login
 $resourceGroup = "rg-floorplan-tiler"
 $location = "eastus"
 $appName = "blocks-floorplan-tiler"
-$storageConnStr = "DefaultEndpointsProtocol=https;AccountName=blocksplayground;AccountKey=kkEgPRG9ve1s/1mv/xNXdMwpd4Yp7tQVnweFnQvbWCK45khrlyJJnhLVKKZXB8BS/fzhRIPkYtEO+AStKbWzrw==;EndpointSuffix=core.windows.net"
+$storageConnStr = "YOUR_STORAGE_CONNECTION_STRING_HERE"
 ```
 
 ### 3. Create Resource Group

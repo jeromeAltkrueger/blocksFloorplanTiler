@@ -76,7 +76,7 @@ Set these in:
 pip install -r requirements.txt
 
 # Set environment variable (Windows)
-set AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=blocksplayground;AccountKey=kkEgPRG9ve1s/1mv/xNXdMwpd4Yp7tQVnweFnQvbWCK45khrlyJJnhLVKKZXB8BS/fzhRIPkYtEO+AStKbWzrw==;EndpointSuffix=core.windows.net
+set AZURE_STORAGE_CONNECTION_STRING=YOUR_STORAGE_CONNECTION_STRING_HERE
 
 # Optional: Set PDF_SCALE to 40 for ultra-high quality
 set PDF_SCALE=40.0
