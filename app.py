@@ -88,11 +88,13 @@ def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 2
                 logger.info(f"Adjusted scale to {new_scale:.2f}x, new dimensions: {target_width}x{target_height}")
             
             # Render page to PIL Image
+            actual_scale = scale if target_width <= max_dimension and target_height <= max_dimension else new_scale
             pil_image = page.render(
-                scale=scale if target_width <= max_dimension and target_height <= max_dimension else new_scale,
+                scale=actual_scale,
                 rotation=0,
-                crop=(0, 0, 0, 0)
-            ).to_pil()
+                crop=(0, 0, 0, 0),
+                bitmap_maker=pdfium.BitmapConv.pil_image
+            )
             
             images.append(pil_image)
             
