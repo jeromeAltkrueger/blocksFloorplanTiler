@@ -2,7 +2,7 @@
 FastAPI application for floorplan PDF tiling service.
 Converted from Azure Functions for deployment to Azure Container Apps.
 """
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import logging
@@ -16,6 +16,9 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 import math
 import os
 import uvicorn
+import uuid
+import threading
+from enum import Enum
 
 # Configure logging
 logging.basicConfig(
@@ -26,6 +29,17 @@ logger = logging.getLogger(__name__)
 
 # Disable PIL decompression bomb check for large floor plans
 Image.MAX_IMAGE_PIXELS = None
+
+# Job status tracking
+class JobStatus(str, Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+# In-memory job store (for simple implementation)
+jobs_store = {}
+jobs_lock = threading.Lock()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -472,33 +486,128 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/api/status/{job_id}")
+async def get_job_status(job_id: str):
+    """Get the status of a processing job"""
+    with jobs_lock:
+        if job_id not in jobs_store:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        job = jobs_store[job_id]
+        return {
+            "job_id": job_id,
+            "status": job["status"],
+            "progress": job.get("progress", 0),
+            "message": job.get("message", ""),
+            "created_at": job["created_at"],
+            "updated_at": job["updated_at"],
+            "result": job.get("result")
+        }
+
+
+def update_job_progress(job_id: str, progress: int, message: str):
+    """Helper to update job progress"""
+    with jobs_lock:
+        if job_id in jobs_store:
+            jobs_store[job_id]["progress"] = progress
+            jobs_store[job_id]["message"] = message
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+
+
+def process_floorplan_background(job_id: str, file_url: str):
+    """Background task to process the floorplan"""
+    try:
+        # Update status to processing
+        with jobs_lock:
+            jobs_store[job_id]["status"] = JobStatus.PROCESSING
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+        
+        # Call the synchronous processing logic
+        result = process_floorplan_sync(file_url, job_id)
+        
+        # Mark as completed
+        with jobs_lock:
+            jobs_store[job_id]["status"] = JobStatus.COMPLETED
+            jobs_store[job_id]["progress"] = 100
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+            jobs_store[job_id]["message"] = "Processing completed successfully"
+            jobs_store[job_id]["result"] = result
+            
+    except Exception as e:
+        logger.error(f"Job {job_id} failed: {str(e)}", exc_info=True)
+        with jobs_lock:
+            jobs_store[job_id]["status"] = JobStatus.FAILED
+            jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
+            jobs_store[job_id]["message"] = str(e)
+
+
 @app.post("/api/process-floorplan")
-async def process_floorplan(request: ProcessFloorplanRequest):
+async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: BackgroundTasks):
     """
-    Process a PDF floorplan and generate tile pyramid.
+    Submit a PDF floorplan for processing (async - returns immediately).
     
     Args:
-        request: ProcessFloorplanRequest with file_url and optional floorplan_name
+        request: ProcessFloorplanRequest with file_url
         
     Returns:
-        JSON response with floorplan_id, dimensions, quality, tiles info, and URLs
+        JSON response with job_id for tracking progress
     """
-    logger.info(f"Processing floorplan from URL: {request.file_url}")
+    logger.info(f"Received floorplan processing request: {request.file_url}")
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    
+    # Create job record
+    now = datetime.utcnow().isoformat()
+    with jobs_lock:
+        jobs_store[job_id] = {
+            "job_id": job_id,
+            "file_url": request.file_url,
+            "status": JobStatus.QUEUED,
+            "progress": 0,
+            "message": "Job queued for processing",
+            "created_at": now,
+            "updated_at": now,
+            "result": None
+        }
+    
+    # Start background processing
+    background_tasks.add_task(process_floorplan_background, job_id, request.file_url)
+    
+    logger.info(f"Job {job_id} queued for processing")
+    
+    return {
+        "job_id": job_id,
+        "status": JobStatus.QUEUED,
+        "message": "Job queued for processing",
+        "status_url": f"/api/status/{job_id}"
+    }
+
+
+def process_floorplan_sync(file_url: str, job_id: str):
+    """
+    Synchronous processing logic (moved from original async endpoint).
+    Updates job progress throughout processing.
+    
+    Args:
+        file_url: URL of the PDF to process
+        job_id: Job ID for progress tracking
+        
+    Returns:
+        Result dictionary with floorplan info
+    """
+    update_job_progress(job_id, 5, "Downloading PDF...")
+    logger.info(f"Job {job_id}: Processing floorplan from URL: {file_url}")
     
     try:
         # Download the PDF from Azure Blob Storage or URL
         try:
-            file_url = request.file_url
-            
             # Check if it's an Azure Blob Storage URL
             if 'blob.core.windows.net' in file_url:
                 # Use Azure SDK to download from blob storage
                 connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
                 if not connection_string:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Storage connection string not configured"
-                    )
+                    raise Exception("Storage connection string not configured")
                 
                 # Parse the blob URL to extract container and blob name
                 from urllib.parse import urlparse
@@ -514,12 +623,14 @@ async def process_floorplan(request: ProcessFloorplanRequest):
                 blob_client = blob_service.get_blob_client(container_name, blob_name)
                 file_content = blob_client.download_blob().readall()
                 logger.info(f"Downloaded PDF from blob storage: {len(file_content)} bytes")
+                update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
             else:
                 # Download from external URL
                 import urllib.request
                 with urllib.request.urlopen(file_url) as response:
                     file_content = response.read()
                 logger.info(f"Downloaded PDF from URL: {len(file_content)} bytes")
+                update_job_progress(job_id, 10, "PDF downloaded, starting conversion...")
         except Exception as download_error:
             logger.error(f"Error downloading file: {str(download_error)}", exc_info=True)
             raise HTTPException(
@@ -594,17 +705,16 @@ async def process_floorplan(request: ProcessFloorplanRequest):
         )
         
         # 1. Convert PDF to PNG (single page expected)
+        update_job_progress(job_id, 15, "Converting PDF to image...")
         images = pdf_to_images(file_content, scale=PDF_SCALE, max_dimension=MAX_DIMENSION)
         
         if len(images) == 0:
-            raise HTTPException(
-                status_code=500,
-                detail="No images generated from PDF"
-            )
+            raise Exception("No images generated from PDF")
         
         # Use first page (floor plans should be single page)
         floor_plan_image = images[0]
         logger.info(f"Floor plan dimensions (pre-trim): {floor_plan_image.width}x{floor_plan_image.height} pixels")
+        update_job_progress(job_id, 20, "PDF converted, preparing image...")
         
         # Release extra images from memory immediately
         if len(images) > 1:
@@ -635,12 +745,14 @@ async def process_floorplan(request: ProcessFloorplanRequest):
         
         # 3. Generate tile pyramid using Simple CRS
         logger.info("🗺️ Generating Simple CRS tile pyramid with high quality...")
+        update_job_progress(job_id, 30, f"Generating {total_levels} zoom levels of tiles...")
         
         zoom_levels = list(range(min_zoom, max_zoom + 1))
         floorplan_tiler = SimpleFloorplanTiler(tile_size=tile_size)
         pyramid = floorplan_tiler.tile_image(floor_plan_image, zoom_levels)
         total_tiles = sum(len(tiles) for tiles in pyramid.values())
         logger.info(f"Generated {total_tiles} high-quality tiles across {len(pyramid)} zoom levels")
+        update_job_progress(job_id, 60, f"Generated {total_tiles} tiles, uploading to storage...")
         
         # 4. Generate preview image
         logger.info("Generating preview image...")
@@ -702,6 +814,7 @@ async def process_floorplan(request: ProcessFloorplanRequest):
             base_image_data=base_image_data,
             base_image_format=base_image_format
         )
+        update_job_progress(job_id, 90, f"Uploaded {total_tiles} tiles to storage...")
         
         # Release memory
         preview.close()
@@ -723,6 +836,8 @@ async def process_floorplan(request: ProcessFloorplanRequest):
             logger.info(f"Archived original PDF at: {dest_blob_name}")
         except Exception as copy_err:
             logger.warning(f"Could not store archived PDF copy: {str(copy_err)}")
+        
+        update_job_progress(job_id, 95, "Finalizing floor plan processing...")
         
         logger.info(f"🚀 Successfully created tiled floor plan: {floorplan_id}")
         logger.info(f"   📐 Dimensions: {floor_plan_image.width}x{floor_plan_image.height}px")
