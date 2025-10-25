@@ -48,11 +48,10 @@ jobs:
             --file Dockerfile \
             .
           
-          # Update Container App with new image and configure ACR authentication
+          # Update Container App with new image
           az containerapp update \
             --name blockstilingservice \
             --resource-group KompassExperimental \
-            --image ca285afb5d06acr.azurecr.io/blockstilingservice:${IMAGE_TAG} \
-            --registry-server ca285afb5d06acr.azurecr.io
+            --image ca285afb5d06acr.azurecr.io/blockstilingservice:${IMAGE_TAG}
 
 
