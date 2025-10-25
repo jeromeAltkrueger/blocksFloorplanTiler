@@ -545,8 +545,8 @@ async def process_floorplan(request: ProcessFloorplanRequest):
         # ============================================================
         
         # 🎨 QUALITY SETTINGS (Configurable via environment variables):
-        PDF_SCALE = float(os.environ.get('PDF_SCALE', '15.0'))  # 15.0=1080 DPI, 40.0=2880 DPI
-        MAX_DIMENSION = int(os.environ.get('MAX_DIMENSION', '30000'))  # 30K pixels max
+        PDF_SCALE = float(os.environ.get('PDF_SCALE', '5.0'))  # 5.0=360 DPI (reduced for stability)
+        MAX_DIMENSION = int(os.environ.get('MAX_DIMENSION', '15000'))  # 15K pixels max (reduced)
         
         # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
         MAX_ZOOM_LIMIT = 15      # Maximum zoom levels allowed
