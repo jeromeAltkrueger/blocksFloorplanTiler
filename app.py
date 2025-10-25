@@ -656,7 +656,7 @@ def process_floorplan_sync(file_url: str, job_id: str):
         # ============================================================
         
         # 🎨 QUALITY SETTINGS (Configurable via environment variables):
-        PDF_SCALE = float(os.environ.get('PDF_SCALE', '40.0'))  # 40.0=2880 DPI (extreme quality for deep zoom)
+        PDF_SCALE = float(os.environ.get('PDF_SCALE', '50.0'))  # 50.0=3600 DPI (ultra-extreme quality for deep zoom)
         MAX_DIMENSION = int(os.environ.get('MAX_DIMENSION', '30000'))  # 30K pixels max
         
         # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
@@ -668,7 +668,7 @@ def process_floorplan_sync(file_url: str, job_id: str):
         
         # ✅ Deep zoom with upscaling beyond native resolution
         # For PDF_SCALE=15: Native res at zoom ~6-7, upscales for 8-10
-        # For PDF_SCALE=40: Native res at zoom ~8-9, upscales for 10-12
+        # For PDF_SCALE=50: Native res at zoom ~8-9, upscales for 10-12
         # ============================================================
         
         # Check if the file is a PDF
@@ -731,29 +731,44 @@ def process_floorplan_sync(file_url: str, job_id: str):
         tile_size = TILE_SIZE_ENV
         
         # Calculate optimal max zoom based on image dimensions
-        # Goal: At max zoom, we want roughly 1-4 tiles per dimension (perfect native resolution)
+        # Goal: Efficient tile distribution - zoom 0 should show full image in ~1-2 tiles
         if FORCED_MAX_Z_ENV == -1:
-            # Auto-calculate: Find zoom level where image fits in ~2-8 tiles per dimension
+            # Smart calculation: Work backwards from zoom 0 constraint
+            # At zoom 0, we want the entire image to fit in roughly 1-2 tiles per dimension
+            # Simple CRS scaling: At zoom Z, scale = 2^(Z - max_zoom)
+            # At zoom 0: scaled_size = original_size * 2^(0 - max_zoom) = original_size / (2^max_zoom)
+            # We want: scaled_size ≈ tile_size (so it fits in ~1 tile at zoom 0)
+            # So: original_size / (2^max_zoom) ≈ tile_size
+            # Therefore: 2^max_zoom ≈ original_size / tile_size
+            # max_zoom ≈ log2(original_size / tile_size)
+            
             max_dim = max(floor_plan_image.width, floor_plan_image.height)
             
-            # Calculate tiles needed at zoom 0 (1 tile covers entire image)
-            # At each zoom level, tiles double: zoom 0 = 1 tile, zoom 1 = 2 tiles, zoom 2 = 4 tiles, etc.
-            # We want: tile_size * (2^zoom) ≈ max_dim
-            # So: 2^zoom ≈ max_dim / tile_size
-            # zoom ≈ log2(max_dim / tile_size)
+            # Calculate zoom where image naturally fits tile grid (no 1-tile waste)
+            # This gives us the zoom level where the image is shown at native resolution
+            base_zoom = math.ceil(math.log2(max_dim / tile_size))
             
-            optimal_zoom = math.ceil(math.log2(max_dim / tile_size))
+            # Apply ZOOM_BOOST only if it doesn't create wasteful low-zoom levels
+            # Check if adding boost would make zoom 0 show image < tile_size (1 tile only)
+            min_dimension_at_zoom_0 = min(floor_plan_image.width, floor_plan_image.height) / (2 ** (base_zoom + ZOOM_BOOST))
             
-            # Add ZOOM_BOOST extra levels for deeper zoom with upscaling
-            boosted_zoom = optimal_zoom + ZOOM_BOOST
-            max_zoom = max(0, min(boosted_zoom, MAX_ZOOM_LIMIT))
-            
-            logger.info(
-                f"🎯 Auto-calculated max zoom: {max_zoom} "
-                f"(native optimal: {optimal_zoom}, boost: +{ZOOM_BOOST}, "
-                f"image {floor_plan_image.width}x{floor_plan_image.height}, "
-                f"max_dim={max_dim})"
-            )
+            if min_dimension_at_zoom_0 < tile_size / 2:
+                # Would create 1-tile zoom levels - reduce boost
+                adjusted_boost = max(0, math.floor(math.log2(min(floor_plan_image.width, floor_plan_image.height) / (tile_size / 2))))
+                max_zoom = max(0, min(base_zoom + adjusted_boost, MAX_ZOOM_LIMIT))
+                logger.info(
+                    f"🎯 Auto-calculated max zoom: {max_zoom} "
+                    f"(base: {base_zoom}, boost adjusted: {adjusted_boost} to avoid 1-tile waste, "
+                    f"image {floor_plan_image.width}x{floor_plan_image.height})"
+                )
+            else:
+                # Boost is safe - won't create 1-tile levels
+                max_zoom = max(0, min(base_zoom + ZOOM_BOOST, MAX_ZOOM_LIMIT))
+                logger.info(
+                    f"🎯 Auto-calculated max zoom: {max_zoom} "
+                    f"(base: {base_zoom}, boost: +{ZOOM_BOOST}, "
+                    f"image {floor_plan_image.width}x{floor_plan_image.height})"
+                )
         else:
             # Use forced max zoom from environment
             max_zoom = max(0, min(FORCED_MAX_Z_ENV, MAX_ZOOM_LIMIT))
