@@ -7,8 +7,7 @@ uvicorn[standard]==0.27.0
 pydantic==2.5.3
 
 # PDF Processing
-pdf2image==1.16.3
-pypdfium2==4.18.0  # Backup option
+PyMuPDF==1.23.8  # fitz - high-performance PDF rendering
 
 # Image Processing
 pillow==10.2.0

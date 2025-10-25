@@ -6,8 +6,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import logging
-import pypdfium2 as pdfium
-from pdf2image import convert_from_bytes
+import fitz  # PyMuPDF
 from PIL import Image, ImageChops
 from typing import List, Tuple, Dict, Optional
 import io
@@ -39,7 +38,7 @@ class ProcessFloorplanRequest(BaseModel):
 
 def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 20000) -> List[Image.Image]:
     """
-    Convert PDF bytes to a list of PIL Image objects using pdf2image.
+    Convert PDF bytes to a list of PIL Image objects using PyMuPDF (fitz).
     Optimized for large single-page floor plans with extreme aspect ratios.
     
     Args:
@@ -48,7 +47,7 @@ def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 2
                2.0 = 144 DPI (standard)
                4.0 = 288 DPI (high quality)
                6.0 = 432 DPI (very high quality)
-               8.0 = 576 DPI (extreme quality, large files)
+               15.0 = 1080 DPI (extreme quality)
         max_dimension: Maximum width or height in pixels before reducing scale
                        This prevents timeouts on extremely large dimensions (default 20000)
     
@@ -58,41 +57,55 @@ def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 2
     try:
         logger.info(f"Starting PDF conversion at scale {scale}x")
         
-        # Calculate DPI from scale (72 DPI is default for PDFs)
-        # Cap DPI at reasonable limit to prevent pdf2image issues
-        dpi = min(int(scale * 72), 600)  # Max 600 DPI
-        if dpi != int(scale * 72):
-            logger.warning(f"Requested DPI {int(scale * 72)} exceeds limit, capped at {dpi}")
+        # Open PDF from bytes
+        pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
+        logger.info(f"PDF loaded: {pdf_document.page_count} page(s)")
         
-        logger.info(f"Converting PDF at {dpi} DPI")
+        images = []
         
-        # Convert PDF to images using pdf2image
-        images = convert_from_bytes(pdf_content, dpi=dpi, fmt='png')
-        logger.info(f"PDF loaded: {len(images)} page(s)")
-        
-        # Validate images are not empty
-        for idx, img in enumerate(images):
-            if img.width < 10 or img.height < 10:
-                raise ValueError(f"Page {idx+1} rendered to invalid size: {img.width}x{img.height}. PDF may be corrupt or empty.")
-        
-        # Check if any image exceeds max_dimension and resize if needed
-        processed_images = []
-        for page_index, img in enumerate(images):
-            if img.width > max_dimension or img.height > max_dimension:
-                logger.warning(f"Page {page_index + 1} dimensions too large ({img.width}x{img.height}), resizing")
-                
-                # Calculate scale to fit within max_dimension
-                scale_factor = max_dimension / max(img.width, img.height)
-                new_width = int(img.width * scale_factor)
-                new_height = int(img.height * scale_factor)
-                
-                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                logger.info(f"Resized to {new_width}x{new_height}")
+        for page_num in range(pdf_document.page_count):
+            page = pdf_document[page_num]
             
-            processed_images.append(img)
-            logger.info(f"Page {page_index + 1}: {img.width}x{img.height} pixels, aspect ratio: {img.width/img.height:.2f}:1")
+            # Get page dimensions in points
+            rect = page.rect
+            width_pt = rect.width
+            height_pt = rect.height
+            
+            # Calculate target dimensions
+            target_width = int(width_pt * scale)
+            target_height = int(height_pt * scale)
+            
+            # Check if dimensions are too large
+            actual_scale = scale
+            if target_width > max_dimension or target_height > max_dimension:
+                logger.warning(f"Page {page_num + 1} dimensions too large ({target_width}x{target_height}), reducing scale")
+                
+                # Calculate reduced scale to fit within max_dimension
+                scale_factor = max_dimension / max(target_width, target_height)
+                actual_scale = scale * scale_factor
+                
+                target_width = int(width_pt * actual_scale)
+                target_height = int(height_pt * actual_scale)
+                
+                logger.info(f"Adjusted scale to {actual_scale:.2f}x, new dimensions: {target_width}x{target_height}")
+            
+            # Create transformation matrix for scaling
+            mat = fitz.Matrix(actual_scale, actual_scale)
+            
+            # Render page to pixmap (high quality)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            
+            # Convert pixmap to PIL Image
+            img_data = pix.tobytes("png")
+            pil_image = Image.open(io.BytesIO(img_data))
+            
+            images.append(pil_image)
+            
+            logger.info(f"Page {page_num + 1}: {pil_image.width}x{pil_image.height} pixels, aspect ratio: {pil_image.width/pil_image.height:.2f}:1")
         
-        return processed_images
+        pdf_document.close()
+        
+        return images
     
     except Exception as e:
         logger.error(f"Error converting PDF to images: {str(e)}")

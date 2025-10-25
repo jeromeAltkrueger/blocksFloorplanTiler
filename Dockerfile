@@ -4,7 +4,7 @@
 # Stage 1: Builder - Install dependencies
 FROM python:3.11-slim as builder
 
-# Install system dependencies required for Pillow, pypdfium2, and poppler (pdf2image)
+# Install system dependencies required for Pillow and PyMuPDF
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
@@ -13,7 +13,6 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     libpng-dev \
     libwebp-dev \
-    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Create virtual environment
@@ -33,7 +32,6 @@ RUN apt-get update && apt-get install -y \
     libjpeg62-turbo \
     libpng16-16 \
     libwebp7 \
-    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy virtual environment from builder
