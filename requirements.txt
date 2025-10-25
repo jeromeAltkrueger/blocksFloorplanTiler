@@ -7,7 +7,7 @@ uvicorn[standard]==0.27.0
 pydantic==2.5.3
 
 # PDF Processing
-pypdfium2==4.26.0
+pypdfium2==4.18.0
 
 # Image Processing
 pillow==10.2.0
