@@ -31,19 +31,13 @@ jobs:
           tenant-id: ${{ secrets.BLOCKSTILINGSERVICE_AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.BLOCKSTILINGSERVICE_AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and push container image to registry
-        uses: azure/container-apps-deploy-action@v2
-        with:
-          appSourcePath: ${{ github.workspace }}
-          _dockerfilePathKey_: _dockerfilePath_
-          _targetLabelKey_: _targetLabel_
-          registryUrl: 
-          registryUsername: ${{ secrets.BLOCKSTILINGSERVICE_REGISTRY_USERNAME }}
-          registryPassword: ${{ secrets.BLOCKSTILINGSERVICE_REGISTRY_PASSWORD }}
-          containerAppName: blockstilingservice
-          resourceGroup: KompassExperimental
-          imageToBuild: default/[parameters('containerAppName')]:${{ github.sha }}
-          _buildArgumentsKey_: |
-            _buildArgumentsValues_
+      - name: Build and deploy to Azure Container Apps
+        run: |
+          az containerapp up \
+            --name blockstilingservice \
+            --resource-group KompassExperimental \
+            --source . \
+            --ingress external \
+            --target-port 8000
 
 
