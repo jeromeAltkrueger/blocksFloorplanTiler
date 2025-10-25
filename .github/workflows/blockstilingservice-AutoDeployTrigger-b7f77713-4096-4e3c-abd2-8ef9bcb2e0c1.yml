@@ -37,20 +37,7 @@ jobs:
           az containerapp identity assign \
             --name blockstilingservice \
             --resource-group KompassExperimental \
-            --system-assigned
-          
-          # Get the principal ID of the managed identity
-          PRINCIPAL_ID=$(az containerapp show \
-            --name blockstilingservice \
-            --resource-group KompassExperimental \
-            --query "identity.principalId" -o tsv)
-          
-          # Grant AcrPull role to the managed identity
-          ACR_ID=$(az acr show --name ca285afb5d06acr --resource-group KompassExperimental --query "id" -o tsv)
-          az role assignment create \
-            --assignee $PRINCIPAL_ID \
-            --role AcrPull \
-            --scope $ACR_ID
+            --system-assigned || true
           
           # Build container image in ACR
           IMAGE_TAG=$(date +%Y%m%d%H%M%S)
