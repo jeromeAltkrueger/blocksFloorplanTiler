@@ -550,7 +550,7 @@ async def process_floorplan(request: ProcessFloorplanRequest):
         
         # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
         MAX_ZOOM_LIMIT = 15      # Maximum zoom levels allowed
-        FORCED_MAX_Z_ENV = int(os.environ.get('FORCED_MAX_Z', '10'))  # Max zoom level
+        FORCED_MAX_Z_ENV = int(os.environ.get('FORCED_MAX_Z', '5'))  # Max zoom level
         TILE_SIZE_ENV = int(os.environ.get('TILE_SIZE', '512'))  # 512px tiles
         MIN_ZOOM_ENV = int(os.environ.get('MIN_ZOOM', '0'))  # Start from zoom level 0
         
