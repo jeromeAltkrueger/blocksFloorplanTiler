@@ -24,6 +24,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Disable PIL decompression bomb check for large floor plans
+Image.MAX_IMAGE_PIXELS = None
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Blocks Floorplan Tiler Service",
