@@ -83,6 +83,15 @@ class DeleteFloorplanRequest(BaseModel):
     entity: str
 
 
+class DeleteFloorplanItem(BaseModel):
+    entity_id: int
+    entity: str
+
+
+class MassDeleteFloorplanRequest(BaseModel):
+    items: List[DeleteFloorplanItem]
+
+
 def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 20000) -> List[Image.Image]:
     """
     Convert PDF bytes to a list of PIL Image objects using PyMuPDF (fitz).
@@ -625,6 +634,124 @@ async def delete_floorplan(request: DeleteFloorplanRequest, api_key_valid: bool 
         raise HTTPException(
             status_code=500,
             detail=f"Error deleting floorplan: {str(e)}"
+        )
+
+
+@app.delete("/api/mass-delete-floorplan")
+async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_valid: bool = Depends(verify_api_key)):
+    """
+    Delete multiple floorplans in a single request.
+    
+    Args:
+        request: MassDeleteFloorplanRequest with array of items (entity, entity_id pairs)
+        
+    Returns:
+        JSON response with deletion results for each item
+    """
+    logger.info(f"Received mass delete request for {len(request.items)} items")
+    
+    try:
+        # Get storage connection
+        connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        if not connection_string:
+            raise HTTPException(
+                status_code=500,
+                detail="Storage connection string not configured"
+            )
+        
+        blob_service = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service.get_container_client("blocks")
+        
+        results = []
+        total_deleted = 0
+        
+        for item in request.items:
+            try:
+                # Find all blobs matching the pattern
+                prefix = f"floorplans/{item.entity}-{item.entity_id}-"
+                logger.info(f"Searching for blobs with prefix: {prefix}")
+                
+                existing_blobs = container_client.list_blobs(name_starts_with=prefix)
+                blobs_to_delete = [blob.name for blob in existing_blobs]
+                
+                if not blobs_to_delete:
+                    logger.info(f"No floorplans found for {item.entity}-{item.entity_id}")
+                    results.append({
+                        "entity": item.entity,
+                        "entity_id": item.entity_id,
+                        "success": True,
+                        "deleted_count": 0,
+                        "message": "No floorplans found"
+                    })
+                    continue
+                
+                # Delete all matching blobs
+                logger.info(f"Deleting {len(blobs_to_delete)} blobs for {item.entity}-{item.entity_id}")
+                deleted_count = 0
+                failed_deletions = []
+                
+                for blob_name in blobs_to_delete:
+                    try:
+                        container_client.delete_blob(blob_name)
+                        deleted_count += 1
+                        total_deleted += 1
+                        logger.info(f"Deleted: {blob_name}")
+                    except Exception as del_err:
+                        logger.error(f"Failed to delete {blob_name}: {del_err}")
+                        failed_deletions.append(blob_name)
+                
+                if failed_deletions:
+                    results.append({
+                        "entity": item.entity,
+                        "entity_id": item.entity_id,
+                        "success": False,
+                        "deleted_count": deleted_count,
+                        "failed_count": len(failed_deletions),
+                        "message": f"Partially deleted: {deleted_count} succeeded, {len(failed_deletions)} failed"
+                    })
+                else:
+                    results.append({
+                        "entity": item.entity,
+                        "entity_id": item.entity_id,
+                        "success": True,
+                        "deleted_count": deleted_count,
+                        "message": "All floorplans deleted successfully"
+                    })
+                    logger.info(f"✅ Successfully deleted all floorplans for {item.entity}-{item.entity_id}")
+                    
+            except Exception as item_err:
+                logger.error(f"Error deleting {item.entity}-{item.entity_id}: {str(item_err)}")
+                results.append({
+                    "entity": item.entity,
+                    "entity_id": item.entity_id,
+                    "success": False,
+                    "deleted_count": 0,
+                    "message": f"Error: {str(item_err)}"
+                })
+        
+        # Summary
+        successful_items = sum(1 for r in results if r["success"])
+        failed_items = len(results) - successful_items
+        
+        logger.info(f"✅ Mass deletion completed: {total_deleted} total blobs deleted, {successful_items}/{len(results)} items successful")
+        
+        return {
+            "success": failed_items == 0,
+            "message": f"Mass deletion completed: {successful_items} successful, {failed_items} failed",
+            "total_items": len(results),
+            "successful_items": successful_items,
+            "failed_items": failed_items,
+            "total_blobs_deleted": total_deleted,
+            "results": results
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error in mass deletion: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error in mass deletion: {str(e)}"
         )
 
 
