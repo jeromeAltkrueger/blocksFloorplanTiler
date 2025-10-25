@@ -787,21 +787,8 @@ def process_floorplan_sync(file_url: str, job_id: str):
         logger.info("Generating preview image...")
         preview = generate_preview(floor_plan_image, max_width=800)
         
-        # Save optimized base image for reference
-        base_image_buffer = io.BytesIO()
-        try:
-            floor_plan_image.save(base_image_buffer, format='WebP', quality=85, method=4)
-            base_image_format = 'webp'
-            logger.info("✅ Using WebP format for base image compression")
-        except Exception:
-            base_image_buffer = io.BytesIO()
-            floor_plan_image.save(base_image_buffer, format='PNG', compress_level=6, optimize=True)
-            base_image_format = 'png'
-            logger.info("✅ Using PNG format for base image compression")
-        
-        base_image_data = base_image_buffer.getvalue()
-        base_image_size_mb = len(base_image_data) / (1024*1024)
-        logger.info(f"📦 Base image compressed to: {base_image_size_mb:.2f} MB")
+        # Skip base image to save memory - tiles are sufficient
+        logger.info("⚠️ Skipping base image save to conserve memory for large floorplans")
         
         # 5. Create metadata
         metadata = create_metadata(
@@ -816,9 +803,7 @@ def process_floorplan_sync(file_url: str, job_id: str):
         metadata["quality_settings"] = {
             "pdf_scale": PDF_SCALE,
             "max_dimension": MAX_DIMENSION,
-            "dpi": PDF_SCALE * 72,
-            "base_image_format": base_image_format,
-            "base_image_size_mb": round(base_image_size_mb, 2)
+            "dpi": PDF_SCALE * 72
         }
         logger.info(f"Created metadata for floor plan: {floorplan_id}")
         
@@ -839,9 +824,9 @@ def process_floorplan_sync(file_url: str, job_id: str):
             original_blob_name=myblob_name,
             connection_string=connection_string,
             container="blocks",
-            base_image=floor_plan_image,
-            base_image_data=base_image_data,
-            base_image_format=base_image_format
+            base_image=None,
+            base_image_data=None,
+            base_image_format="png"
         )
         update_job_progress(job_id, 90, f"Uploaded {total_tiles} tiles to storage...")
         
@@ -871,8 +856,7 @@ def process_floorplan_sync(file_url: str, job_id: str):
         logger.info(f"🚀 Successfully created tiled floor plan: {floorplan_id}")
         logger.info(f"   📐 Dimensions: {floor_plan_image.width}x{floor_plan_image.height}px")
         logger.info(f"   🎨 Quality: {PDF_SCALE * 72:.0f} DPI (PDF_SCALE={PDF_SCALE})")
-        logger.info(f"   📦 Base image: {base_image_size_mb:.2f} MB ({base_image_format.upper()})")
-        logger.info(f"   🗺️ Zoom levels: {total_levels} ({min_zoom}-{max_zoom})")
+        logger.info(f"   ️ Zoom levels: {total_levels} ({min_zoom}-{max_zoom})")
         logger.info(f"   🏗️ Total tiles: {total_tiles}")
         
         # Return success response
@@ -884,9 +868,7 @@ def process_floorplan_sync(file_url: str, job_id: str):
                 "height": floor_plan_image.height
             },
             "quality": {
-                "dpi": int(PDF_SCALE * 72),
-                "base_image_size_mb": round(base_image_size_mb, 2),
-                "format": base_image_format.upper()
+                "dpi": int(PDF_SCALE * 72)
             },
             "tiles": {
                 "total": total_tiles,
