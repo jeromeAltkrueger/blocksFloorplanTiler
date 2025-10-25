@@ -59,11 +59,21 @@ def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 2
         logger.info(f"Starting PDF conversion at scale {scale}x")
         
         # Calculate DPI from scale (72 DPI is default for PDFs)
-        dpi = int(scale * 72)
+        # Cap DPI at reasonable limit to prevent pdf2image issues
+        dpi = min(int(scale * 72), 600)  # Max 600 DPI
+        if dpi != int(scale * 72):
+            logger.warning(f"Requested DPI {int(scale * 72)} exceeds limit, capped at {dpi}")
+        
+        logger.info(f"Converting PDF at {dpi} DPI")
         
         # Convert PDF to images using pdf2image
         images = convert_from_bytes(pdf_content, dpi=dpi, fmt='png')
         logger.info(f"PDF loaded: {len(images)} page(s)")
+        
+        # Validate images are not empty
+        for idx, img in enumerate(images):
+            if img.width < 10 or img.height < 10:
+                raise ValueError(f"Page {idx+1} rendered to invalid size: {img.width}x{img.height}. PDF may be corrupt or empty.")
         
         # Check if any image exceeds max_dimension and resize if needed
         processed_images = []
