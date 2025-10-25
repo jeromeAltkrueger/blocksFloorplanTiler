@@ -74,22 +74,11 @@ app = FastAPI(
 # Request model
 class ProcessFloorplanRequest(BaseModel):
     file_url: str
-    entity_id: int
-    entity: str
-
-
-class DeleteFloorplanRequest(BaseModel):
-    entity_id: int
-    entity: str
-
-
-class DeleteFloorplanItem(BaseModel):
-    entity_id: int
-    entity: str
+    file_id: int
 
 
 class MassDeleteFloorplanRequest(BaseModel):
-    items: List[DeleteFloorplanItem]
+    file_ids: List[int]
 
 
 def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 20000) -> List[Image.Image]:
@@ -348,7 +337,7 @@ def trim_whitespace(
         return image
 
 
-def create_metadata(image: Image.Image, max_zoom: int, floorplan_id: str, tile_size: int, min_zoom: int = 0, zoom_levels: List[int] = None, entity_id: int = None, entity: str = None) -> dict:
+def create_metadata(image: Image.Image, max_zoom: int, floorplan_id: str, tile_size: int, min_zoom: int = 0, zoom_levels: List[int] = None, file_id: int = None) -> dict:
     """
     Generate metadata for Web Mercator tile consumption.
     
@@ -359,8 +348,7 @@ def create_metadata(image: Image.Image, max_zoom: int, floorplan_id: str, tile_s
         tile_size: Size of tiles in pixels
         min_zoom: Minimum zoom level
         zoom_levels: List of actual zoom levels generated
-        entity_id: Entity ID (required)
-        entity: Entity name (required)
+        file_id: File ID (required)
     
     Returns:
         Metadata dictionary compatible with Web Mercator tiling
@@ -371,8 +359,7 @@ def create_metadata(image: Image.Image, max_zoom: int, floorplan_id: str, tile_s
     
     return {
         "floorplan_id": floorplan_id,
-        "entity_id": entity_id,
-        "entity": entity,
+        "file_id": file_id,
         "source_image": {
             "width": image.width,
             "height": image.height,
@@ -548,18 +535,18 @@ async def get_job_status(job_id: str, api_key_valid: bool = Depends(verify_api_k
         }
 
 
-@app.delete("/api/delete-floorplan")
-async def delete_floorplan(request: DeleteFloorplanRequest, api_key_valid: bool = Depends(verify_api_key)):
+@app.delete("/api/delete-floorplan/{file_id}")
+async def delete_floorplan(file_id: int, api_key_valid: bool = Depends(verify_api_key)):
     """
-    Delete all floorplans matching the given entity and entity_id.
+    Delete all floorplans matching the given file_id.
     
     Args:
-        request: DeleteFloorplanRequest with entity and entity_id
+        file_id: File ID as path parameter
         
     Returns:
         JSON response with deletion status
     """
-    logger.info(f"Received delete request for entity={request.entity}, entity_id={request.entity_id}")
+    logger.info(f"Received delete request for file_id={file_id}")
     
     try:
         # Get storage connection
@@ -574,7 +561,7 @@ async def delete_floorplan(request: DeleteFloorplanRequest, api_key_valid: bool 
         container_client = blob_service.get_container_client("blocks")
         
         # Find all blobs matching the pattern
-        prefix = f"floorplans/{request.entity}-{request.entity_id}-"
+        prefix = f"floorplans/{file_id}-"
         logger.info(f"Searching for blobs with prefix: {prefix}")
         
         existing_blobs = container_client.list_blobs(name_starts_with=prefix)
@@ -584,17 +571,16 @@ async def delete_floorplan(request: DeleteFloorplanRequest, api_key_valid: bool 
             blobs_to_delete.append(blob.name)
         
         if not blobs_to_delete:
-            logger.info(f"No floorplans found for {request.entity}-{request.entity_id}")
+            logger.info(f"No floorplans found for {file_id}")
             return {
                 "success": True,
                 "message": "No floorplans found to delete",
-                "entity": request.entity,
-                "entity_id": request.entity_id,
+                "file_id": file_id,
                 "deleted_count": 0
             }
         
         # Delete all matching blobs
-        logger.info(f"Deleting {len(blobs_to_delete)} blobs for {request.entity}-{request.entity_id}")
+        logger.info(f"Deleting {len(blobs_to_delete)} blobs for {file_id}")
         deleted_count = 0
         failed_deletions = []
         
@@ -612,18 +598,16 @@ async def delete_floorplan(request: DeleteFloorplanRequest, api_key_valid: bool 
             return {
                 "success": False,
                 "message": f"Partially deleted. {deleted_count} succeeded, {len(failed_deletions)} failed",
-                "entity": request.entity,
-                "entity_id": request.entity_id,
+                "file_id": file_id,
                 "deleted_count": deleted_count,
                 "failed_count": len(failed_deletions)
             }
         
-        logger.info(f"✅ Successfully deleted all floorplans for {request.entity}-{request.entity_id}")
+        logger.info(f"✅ Successfully deleted all floorplans for {file_id}")
         return {
             "success": True,
             "message": "All floorplans deleted successfully",
-            "entity": request.entity,
-            "entity_id": request.entity_id,
+            "file_id": file_id,
             "deleted_count": deleted_count
         }
         
@@ -643,12 +627,12 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
     Delete multiple floorplans in a single request.
     
     Args:
-        request: MassDeleteFloorplanRequest with array of items (entity, entity_id pairs)
+        request: MassDeleteFloorplanRequest with array of file_ids
         
     Returns:
         JSON response with deletion results for each item
     """
-    logger.info(f"Received mass delete request for {len(request.items)} items")
+    logger.info(f"Received mass delete request for {len(request.file_ids)} items")
     
     try:
         # Get storage connection
@@ -665,20 +649,19 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
         results = []
         total_deleted = 0
         
-        for item in request.items:
+        for file_id in request.file_ids:
             try:
                 # Find all blobs matching the pattern
-                prefix = f"floorplans/{item.entity}-{item.entity_id}-"
+                prefix = f"floorplans/{file_id}-"
                 logger.info(f"Searching for blobs with prefix: {prefix}")
                 
                 existing_blobs = container_client.list_blobs(name_starts_with=prefix)
                 blobs_to_delete = [blob.name for blob in existing_blobs]
                 
                 if not blobs_to_delete:
-                    logger.info(f"No floorplans found for {item.entity}-{item.entity_id}")
+                    logger.info(f"No floorplans found for {file_id}")
                     results.append({
-                        "entity": item.entity,
-                        "entity_id": item.entity_id,
+                        "file_id": file_id,
                         "success": True,
                         "deleted_count": 0,
                         "message": "No floorplans found"
@@ -686,7 +669,7 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
                     continue
                 
                 # Delete all matching blobs
-                logger.info(f"Deleting {len(blobs_to_delete)} blobs for {item.entity}-{item.entity_id}")
+                logger.info(f"Deleting {len(blobs_to_delete)} blobs for {file_id}")
                 deleted_count = 0
                 failed_deletions = []
                 
@@ -702,8 +685,7 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
                 
                 if failed_deletions:
                     results.append({
-                        "entity": item.entity,
-                        "entity_id": item.entity_id,
+                        "file_id": file_id,
                         "success": False,
                         "deleted_count": deleted_count,
                         "failed_count": len(failed_deletions),
@@ -711,19 +693,17 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
                     })
                 else:
                     results.append({
-                        "entity": item.entity,
-                        "entity_id": item.entity_id,
+                        "file_id": file_id,
                         "success": True,
                         "deleted_count": deleted_count,
                         "message": "All floorplans deleted successfully"
                     })
-                    logger.info(f"✅ Successfully deleted all floorplans for {item.entity}-{item.entity_id}")
+                    logger.info(f"✅ Successfully deleted all floorplans for {file_id}")
                     
             except Exception as item_err:
-                logger.error(f"Error deleting {item.entity}-{item.entity_id}: {str(item_err)}")
+                logger.error(f"Error deleting {file_id}: {str(item_err)}")
                 results.append({
-                    "entity": item.entity,
-                    "entity_id": item.entity_id,
+                    "file_id": file_id,
                     "success": False,
                     "deleted_count": 0,
                     "message": f"Error: {str(item_err)}"
@@ -764,7 +744,7 @@ def update_job_progress(job_id: str, progress: int, message: str):
             jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
 
 
-def process_floorplan_background(job_id: str, file_url: str, entity_id: int, entity: str):
+def process_floorplan_background(job_id: str, file_url: str, file_id: int):
     """Background task to process the floorplan"""
     try:
         # Update status to processing
@@ -773,7 +753,7 @@ def process_floorplan_background(job_id: str, file_url: str, entity_id: int, ent
             jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
         
         # Call the synchronous processing logic
-        result = process_floorplan_sync(file_url, job_id, entity_id, entity)
+        result = process_floorplan_sync(file_url, job_id, file_id)
         
         # Mark as completed
         with jobs_lock:
@@ -822,7 +802,7 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
         }
     
     # Start background processing
-    background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.entity_id, request.entity)
+    background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.file_id)
     
     logger.info(f"Job {job_id} queued for processing")
     
@@ -834,7 +814,7 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
     }
 
 
-def process_floorplan_sync(file_url: str, job_id: str, entity_id: int, entity: str):
+def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
     """
     Synchronous processing logic (moved from original async endpoint).
     Updates job progress throughout processing.
@@ -842,8 +822,7 @@ def process_floorplan_sync(file_url: str, job_id: str, entity_id: int, entity: s
     Args:
         file_url: URL of the PDF to process
         job_id: Job ID for progress tracking
-        entity_id: Entity ID (required)
-        entity: Entity name (required)
+        file_id: File ID (required)
         
     Returns:
         Result dictionary with floorplan info
@@ -900,8 +879,8 @@ def process_floorplan_sync(file_url: str, job_id: str, entity_id: int, entity: s
         # Extract base name from filename (remove .pdf extension)
         base_name = floorplan_name.rsplit('.', 1)[0]
         
-        # Create floorplan ID with entity information
-        floorplan_id = f"{entity}-{entity_id}-{base_name}"
+        # Create floorplan ID with file_id
+        floorplan_id = f"{file_id}-{base_name}"
         
         # Check if floorplan already exists
         connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
@@ -914,47 +893,30 @@ def process_floorplan_sync(file_url: str, job_id: str, entity_id: int, entity: s
         blob_service = BlobServiceClient.from_connection_string(connection_string)
         container_client = blob_service.get_container_client("blocks")
         
-        # Check if exact floorplan already exists (same entity, entity_id, and filename)
-        exact_metadata_blob = f"floorplans/{floorplan_id}/metadata.json"
-        exact_metadata_client = container_client.get_blob_client(exact_metadata_blob)
+        # Check if any floorplan already exists with this file_id
+        prefix = f"floorplans/{file_id}-"
+        existing_blobs = list(container_client.list_blobs(name_starts_with=prefix, max_results=1))
         
-        try:
-            # Try to get blob properties - if it exists with exact name, skip processing
-            exact_metadata_client.get_blob_properties()
-            logger.info(f"Floorplan already exists with exact name: {floorplan_id}")
+        if existing_blobs:
+            # Found existing floorplan with this file_id, skip processing
+            logger.info(f"Floorplan already exists for file_id {file_id}, skipping processing")
+            
+            # Extract the existing floorplan_id from the first blob path
+            existing_blob_path = existing_blobs[0].name
+            existing_floorplan_id = existing_blob_path.split('/')[1]
+            
             return {
                 "success": True,
-                "message": "Floorplan already exists",
-                "floorplan_id": floorplan_id,
+                "message": "Floorplan already exists for this file_id",
+                "floorplan_id": existing_floorplan_id,
                 "urls": {
-                    "metadata": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/metadata.json",
-                    "preview": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/preview.jpg",
-                    "tiles": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
+                    "metadata": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/metadata.json",
+                    "preview": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/preview.jpg",
+                    "tiles": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
                 }
             }
-        except Exception:
-            # Exact match doesn't exist, check for different filename with same entity-entity_id
-            logger.info(f"Exact floorplan name not found, checking for other versions of {entity}-{entity_id}")
-            
-            # Find and delete any existing folders that match {entity}-{entity_id}-* (different filename)
-            prefix = f"floorplans/{entity}-{entity_id}-"
-            existing_blobs = container_client.list_blobs(name_starts_with=prefix)
-            blobs_to_delete = []
-            
-            for blob in existing_blobs:
-                blobs_to_delete.append(blob.name)
-            
-            if blobs_to_delete:
-                logger.info(f"Found {len(blobs_to_delete)} existing blobs with different filename for {entity}-{entity_id}, deleting old version")
-                for blob_name in blobs_to_delete:
-                    try:
-                        container_client.delete_blob(blob_name)
-                        logger.info(f"Deleted: {blob_name}")
-                    except Exception as del_err:
-                        logger.warning(f"Failed to delete {blob_name}: {del_err}")
-                logger.info(f"✅ Cleaned up old floorplan data for {entity}-{entity_id}, will process new version")
-            else:
-                logger.info(f"No existing floorplans found for {entity}-{entity_id}, proceeding with new floorplan")
+        
+        logger.info(f"No existing floorplans found for file_id {file_id}, proceeding with new floorplan")
         
         # Create a mock blob name for compatibility
         myblob_name = f"blocks/{floorplan_name}"
@@ -1106,8 +1068,7 @@ def process_floorplan_sync(file_url: str, job_id: str, entity_id: int, entity: s
             tile_size=tile_size, 
             min_zoom=min_zoom,
             zoom_levels=zoom_levels,
-            entity_id=entity_id,
-            entity=entity
+            file_id=file_id
         )
         metadata["total_tiles"] = total_tiles
         metadata["quality_settings"] = {
