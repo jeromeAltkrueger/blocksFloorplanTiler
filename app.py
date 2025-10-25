@@ -34,7 +34,6 @@ app = FastAPI(
 # Request model
 class ProcessFloorplanRequest(BaseModel):
     file_url: str
-    floorplan_name: Optional[str] = None
 
 
 def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 20000) -> List[Image.Image]:
@@ -339,15 +338,14 @@ def upload_tiles_to_blob(
     floorplan_id: str,
     original_blob_name: str,
     connection_string: str,
-    container: str = "floor-plans",
+    container: str = "blocks",
     base_image: Image.Image | None = None,
     base_image_data: bytes | None = None,
     base_image_format: str = "png"
 ):
     """
     Upload entire tile pyramid to Azure Blob Storage.
-    Structure: floor-plans/{floorplan-id}/
-                   ├── {floorplan-id}.pdf (archived original PDF - handled elsewhere)
+    Structure: blocks/floorplans/{floorplan-id}/
                    ├── metadata.json
                    ├── preview.jpg
                    ├── base.png (full-resolution rendered image used for tiling) [optional]
@@ -358,11 +356,11 @@ def upload_tiles_to_blob(
         preview: Preview image
         metadata: Metadata dictionary
         floorplan_id: Unique identifier
-        original_blob_name: Original blob name (e.g., "floor-plans/MyPlan.pdf")
+        original_blob_name: Original blob name
         connection_string: Azure Storage connection string
-        container: Container name (default: "floor-plans")
+        container: Container name (default: "blocks")
     """
-    logger.info(f"Uploading tiles to blob storage: {container}/{floorplan_id}/")
+    logger.info(f"Uploading tiles to blob storage: {container}/floorplans/{floorplan_id}/")
     
     blob_service = BlobServiceClient.from_connection_string(connection_string)
     container_client = blob_service.get_container_client(container)
@@ -375,7 +373,7 @@ def upload_tiles_to_blob(
         logger.warning(f"Container check failed: {str(e)}")
     
     # Upload metadata
-    metadata_blob = f"{floorplan_id}/metadata.json"
+    metadata_blob = f"floorplans/{floorplan_id}/metadata.json"
     container_client.upload_blob(
         metadata_blob, 
         json.dumps(metadata, indent=2),
@@ -389,7 +387,7 @@ def upload_tiles_to_blob(
     preview.save(preview_bytes, format='JPEG', quality=75, optimize=True)
     preview_bytes.seek(0)
     container_client.upload_blob(
-        f"{floorplan_id}/preview.jpg",
+        f"floorplans/{floorplan_id}/preview.jpg",
         preview_bytes,
         overwrite=True,
         content_settings=ContentSettings(content_type="image/jpeg")
@@ -403,7 +401,7 @@ def upload_tiles_to_blob(
             content_type = f"image/{base_image_format}" if base_image_format != "webp" else "image/webp"
             
             container_client.upload_blob(
-                f"{floorplan_id}/{base_filename}",
+                f"floorplans/{floorplan_id}/{base_filename}",
                 base_image_data,
                 overwrite=True,
                 content_settings=ContentSettings(content_type=content_type)
@@ -425,7 +423,7 @@ def upload_tiles_to_blob(
             tile_bytes.seek(0)
             
             # Leaflet standard: {z}/{x}/{y}.png
-            blob_path = f"{floorplan_id}/tiles/{zoom}/{x}/{y}.png"
+            blob_path = f"floorplans/{floorplan_id}/tiles/{zoom}/{x}/{y}.png"
             container_client.upload_blob(
                 blob_path,
                 tile_bytes,
@@ -521,17 +519,18 @@ async def process_floorplan(request: ProcessFloorplanRequest):
                 detail=f"Failed to download file: {str(download_error)}"
             )
         
-        # Extract filename from URL or use provided name
-        floorplan_name = request.floorplan_name
-        if not floorplan_name:
-            from urllib.parse import urlparse
-            parsed_url = urlparse(file_url)
-            floorplan_name = parsed_url.path.split('/')[-1]
-            if not floorplan_name.lower().endswith('.pdf'):
-                floorplan_name = 'floorplan.pdf'
+        # Extract filename from URL
+        from urllib.parse import urlparse
+        parsed_url = urlparse(file_url)
+        floorplan_name = parsed_url.path.split('/')[-1]
+        if not floorplan_name.lower().endswith('.pdf'):
+            floorplan_name = 'floorplan.pdf'
+        
+        # Extract floorplan ID from filename (remove .pdf extension)
+        floorplan_id = floorplan_name.rsplit('.', 1)[0]
         
         # Create a mock blob name for compatibility
-        myblob_name = f"floor-plans/{floorplan_name}"
+        myblob_name = f"blocks/{floorplan_name}"
         
         # ============================================================
         # 🚀 PRODUCTION MODE - HIGH QUALITY TILING SETTINGS
@@ -656,7 +655,6 @@ async def process_floorplan(request: ProcessFloorplanRequest):
         logger.info(f"📦 Base image compressed to: {base_image_size_mb:.2f} MB")
         
         # 5. Create metadata
-        floorplan_id = extract_floorplan_id(myblob_name)
         metadata = create_metadata(
             floor_plan_image, 
             max_zoom, 
@@ -691,7 +689,7 @@ async def process_floorplan(request: ProcessFloorplanRequest):
             floorplan_id=floorplan_id,
             original_blob_name=myblob_name,
             connection_string=connection_string,
-            container="floor-plans",
+            container="blocks",
             base_image=floor_plan_image,
             base_image_data=base_image_data,
             base_image_format=base_image_format
@@ -707,10 +705,10 @@ async def process_floorplan(request: ProcessFloorplanRequest):
 
         # 7. Archive the original PDF
         blob_service = BlobServiceClient.from_connection_string(connection_string)
-        source_container = "floor-plans"
+        source_container = "blocks"
 
         try:
-            dest_blob_name = f"{floorplan_id}/{floorplan_id}.pdf"
+            dest_blob_name = f"floorplans/{floorplan_id}/{floorplan_id}.pdf"
             dest_client = blob_service.get_blob_client(source_container, dest_blob_name)
             content_settings = ContentSettings(content_type="application/pdf")
             dest_client.upload_blob(file_content, overwrite=True, content_settings=content_settings)
@@ -746,9 +744,9 @@ async def process_floorplan(request: ProcessFloorplanRequest):
                 "tile_size": tile_size
             },
             "urls": {
-                "metadata": f"https://blocksplayground.blob.core.windows.net/floor-plans/{floorplan_id}/metadata.json",
-                "preview": f"https://blocksplayground.blob.core.windows.net/floor-plans/{floorplan_id}/preview.png",
-                "tiles": f"https://blocksplayground.blob.core.windows.net/floor-plans/{floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
+                "metadata": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/metadata.json",
+                "preview": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/preview.png",
+                "tiles": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
             }
         }
         
