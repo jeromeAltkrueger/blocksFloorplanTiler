@@ -656,12 +656,13 @@ def process_floorplan_sync(file_url: str, job_id: str):
         # ============================================================
         
         # 🎨 QUALITY SETTINGS (Configurable via environment variables):
-        PDF_SCALE = float(os.environ.get('PDF_SCALE', '15.0'))  # 15.0=1080 DPI (high quality)
+        PDF_SCALE = float(os.environ.get('PDF_SCALE', '40.0'))  # 40.0=2880 DPI (extreme quality for deep zoom)
         MAX_DIMENSION = int(os.environ.get('MAX_DIMENSION', '30000'))  # 30K pixels max
         
         # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
-        MAX_ZOOM_LIMIT = 15      # Maximum zoom levels allowed
+        MAX_ZOOM_LIMIT = 12      # Maximum zoom levels allowed
         FORCED_MAX_Z_ENV = int(os.environ.get('FORCED_MAX_Z', '-1'))  # -1 = auto-calculate based on image size
+        ZOOM_BOOST = int(os.environ.get('ZOOM_BOOST', '3'))  # Add extra zoom levels beyond native (for deep zoom with upscaling)
         TILE_SIZE_ENV = int(os.environ.get('TILE_SIZE', '512'))  # 512px tiles
         MIN_ZOOM_ENV = int(os.environ.get('MIN_ZOOM', '0'))  # Start from zoom level 0
         
@@ -701,7 +702,7 @@ def process_floorplan_sync(file_url: str, job_id: str):
             "Configuration overrides → "
             f"PDF_SCALE={PDF_SCALE}, MAX_DIMENSION={MAX_DIMENSION}, "
             f"MAX_ZOOM_LIMIT={MAX_ZOOM_LIMIT}, FORCED_MAX_Z={FORCED_MAX_Z_ENV}, "
-            f"TILE_SIZE={TILE_SIZE_ENV}, MIN_ZOOM={MIN_ZOOM_ENV}"
+            f"ZOOM_BOOST={ZOOM_BOOST}, TILE_SIZE={TILE_SIZE_ENV}, MIN_ZOOM={MIN_ZOOM_ENV}"
         )
         
         # 1. Convert PDF to PNG (single page expected)
@@ -742,12 +743,16 @@ def process_floorplan_sync(file_url: str, job_id: str):
             # zoom ≈ log2(max_dim / tile_size)
             
             optimal_zoom = math.ceil(math.log2(max_dim / tile_size))
-            max_zoom = max(0, min(optimal_zoom, MAX_ZOOM_LIMIT))
+            
+            # Add ZOOM_BOOST extra levels for deeper zoom with upscaling
+            boosted_zoom = optimal_zoom + ZOOM_BOOST
+            max_zoom = max(0, min(boosted_zoom, MAX_ZOOM_LIMIT))
             
             logger.info(
                 f"🎯 Auto-calculated max zoom: {max_zoom} "
-                f"(image {floor_plan_image.width}x{floor_plan_image.height}, "
-                f"max_dim={max_dim}, tiles_at_max_zoom≈{math.ceil(max_dim/(tile_size*2**max_zoom))})"
+                f"(native optimal: {optimal_zoom}, boost: +{ZOOM_BOOST}, "
+                f"image {floor_plan_image.width}x{floor_plan_image.height}, "
+                f"max_dim={max_dim})"
             )
         else:
             # Use forced max zoom from environment
