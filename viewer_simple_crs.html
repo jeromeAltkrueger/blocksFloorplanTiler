@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Floorplan Viewer - Simple CRS</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; padding: 0; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+        #debug { position: absolute; top: 10px; right: 10px; background: white; padding: 10px; z-index: 1000; font-family: monospace; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div id="debug">Loading...</div>
+    <div id="map"></div>
+    
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Load metadata
+        fetch('https://blocksfloorplanbuilderdata.blob.core.windows.net/blocksfloorplanbuilderdata/metadata.json')
+            .then(response => response.json())
+            .then(metadata => {
+                console.log('Metadata:', metadata);
+                
+                // Extract metadata
+                const width = metadata.width;
+                const height = metadata.height;
+                const minZoom = metadata.min_zoom;
+                const maxZoom = metadata.max_zoom;
+                const tileSize = metadata.tile_size || 512;
+                
+                // CRITICAL: Simple CRS bounds must account for how Leaflet calculates tile coordinates
+                // Leaflet Simple CRS uses [y,x] format (like lat/lng)
+                // The bounds should be [[minY, minX], [maxY, maxX]]
+                const bounds = [[0, 0], [height, width]];
+                
+                console.log('Image dimensions:', width, 'x', height);
+                console.log('Zoom range:', minZoom, '-', maxZoom);
+                console.log('Tile size:', tileSize);
+                console.log('Bounds:', bounds);
+                
+                // Initialize map with Simple CRS
+                const map = L.map('map', {
+                    crs: L.CRS.Simple,
+                    minZoom: minZoom,
+                    maxZoom: maxZoom,
+                    maxBounds: bounds,
+                    maxBoundsViscosity: 1.0
+                });
+                
+                // Calculate center: [y, x] format for Simple CRS
+                const center = [height / 2, width / 2];
+                map.setView(center, maxZoom);
+                
+                // Add tile layer
+                const tileUrl = 'https://blocksfloorplanbuilderdata.blob.core.windows.net/blocksfloorplanbuilderdata/{z}/{x}/{y}.png';
+                
+                const tileLayer = L.tileLayer(tileUrl, {
+                    tileSize: tileSize,
+                    noWrap: true,
+                    bounds: bounds,
+                    attribution: 'Floorplan Tiles'
+                });
+                
+                tileLayer.addTo(map);
+                
+                // Debug: Log tile requests
+                tileLayer.on('tileloadstart', function(e) {
+                    const coords = e.coords;
+                    console.log('Requesting tile:', coords.z + '/' + coords.x + '/' + coords.y);
+                    updateDebug(coords.z, coords.x, coords.y, 'loading');
+                });
+                
+                tileLayer.on('tileload', function(e) {
+                    const coords = e.coords;
+                    console.log('Loaded tile:', coords.z + '/' + coords.x + '/' + coords.y);
+                });
+                
+                tileLayer.on('tileerror', function(e) {
+                    const coords = e.coords;
+                    console.error('Failed to load tile:', coords.z + '/' + coords.x + '/' + coords.y, e.error);
+                    updateDebug(coords.z, coords.x, coords.y, 'error');
+                });
+                
+                // Debug display
+                let lastTile = { z: 0, x: 0, y: 0, status: 'init' };
+                function updateDebug(z, x, y, status) {
+                    lastTile = { z, x, y, status };
+                    const debugDiv = document.getElementById('debug');
+                    
+                    // Calculate expected tile grid size
+                    const scale = Math.pow(2, z - maxZoom);
+                    const scaledWidth = Math.floor(width * scale);
+                    const scaledHeight = Math.floor(height * scale);
+                    const tilesX = Math.ceil(scaledWidth / tileSize);
+                    const tilesY = Math.ceil(scaledHeight / tileSize);
+                    
+                    debugDiv.innerHTML = `
+                        <div><strong>Zoom ${z}</strong></div>
+                        <div>Tile: ${x}, ${y} (${status})</div>
+                        <div>Expected grid: ${tilesX} x ${tilesY}</div>
+                        <div>Scaled image: ${scaledWidth} x ${scaledHeight}</div>
+                        <div>Map center: [${Math.round(map.getCenter().lat)}, ${Math.round(map.getCenter().lng)}]</div>
+                        <div>Bounds: [0,0] to [${height},${width}]</div>
+                    `;
+                }
+                
+                updateDebug(maxZoom, 0, 0, 'init');
+                
+                // Update debug on zoom/pan
+                map.on('zoomend moveend', function() {
+                    updateDebug(map.getZoom(), lastTile.x, lastTile.y, 'viewing');
+                });
+            })
+            .catch(error => {
+                console.error('Failed to load metadata:', error);
+                document.getElementById('debug').textContent = 'Error loading metadata: ' + error.message;
+            });
+    </script>
+</body>
+</html>

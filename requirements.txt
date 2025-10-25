@@ -1,0 +1,19 @@
+# Azure Container Apps - Python Requirements
+# Floorplan PDF Tiling Service
+
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+
+# PDF Processing
+pypdfium2==4.26.0
+
+# Image Processing
+pillow==10.2.0
+
+# Azure Storage
+azure-storage-blob==12.19.0
+
+# Optional: Async support for better performance
+httpx==0.26.0

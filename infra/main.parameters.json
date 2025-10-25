@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "appName": {
+      "value": "blocks-floorplan-tiler"
+    },
+    "location": {
+      "value": "eastus"
+    },
+    "environmentName": {
+      "value": "prod"
+    },
+    "containerImage": {
+      "value": "YOUR_ACR_NAME.azurecr.io/floorplan-tiler:latest"
+    },
+    "storageConnectionString": {
+      "value": "YOUR_STORAGE_CONNECTION_STRING"
+    },
+    "minReplicas": {
+      "value": 1
+    },
+    "maxReplicas": {
+      "value": 10
+    },
+    "cpuCores": {
+      "value": "2"
+    },
+    "memorySize": {
+      "value": "4"
+    }
+  }
+}
