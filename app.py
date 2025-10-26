@@ -561,7 +561,7 @@ async def delete_floorplan(file_id: int, api_key_valid: bool = Depends(verify_ap
         container_client = blob_service.get_container_client("blocks")
         
         # Find all blobs matching the pattern
-        prefix = f"floorplans/{file_id}-"
+        prefix = f"floorplans/{file_id}/"
         logger.info(f"Searching for blobs with prefix: {prefix}")
         
         existing_blobs = container_client.list_blobs(name_starts_with=prefix)
@@ -652,7 +652,7 @@ async def mass_delete_floorplan(request: MassDeleteFloorplanRequest, api_key_val
         for file_id in request.file_ids:
             try:
                 # Find all blobs matching the pattern
-                prefix = f"floorplans/{file_id}-"
+                prefix = f"floorplans/{file_id}/"
                 logger.info(f"Searching for blobs with prefix: {prefix}")
                 
                 existing_blobs = container_client.list_blobs(name_starts_with=prefix)
@@ -879,8 +879,8 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
         # Extract base name from filename (remove .pdf extension)
         base_name = floorplan_name.rsplit('.', 1)[0]
         
-        # Create floorplan ID with file_id
-        floorplan_id = f"{file_id}-{base_name}"
+        # Create floorplan ID - just use file_id as folder name
+        floorplan_id = str(file_id)
         
         # Check if floorplan already exists
         connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
@@ -894,7 +894,7 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
         container_client = blob_service.get_container_client("blocks")
         
         # Check if any floorplan already exists with this file_id
-        prefix = f"floorplans/{file_id}-"
+        prefix = f"floorplans/{file_id}/"
         existing_blob = None
         
         # Get iterator and check if any blob exists with this prefix
@@ -981,6 +981,135 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
             f"MAX_ZOOM_LIMIT={MAX_ZOOM_LIMIT}, FORCED_MAX_Z={FORCED_MAX_Z_ENV}, "
             f"ZOOM_BOOST={ZOOM_BOOST}, TILE_SIZE={TILE_SIZE_ENV}, MIN_ZOOM={MIN_ZOOM_ENV}"
         )
+        
+        # SMART SCALING: Analyze PDF characteristics and determine optimal scale
+        # Check file size - simple documents are small, complex floorplans are large
+        file_size_mb = len(file_content) / (1024 * 1024)
+        logger.info(f"PDF file size: {file_size_mb:.2f} MB")
+        
+        # Open PDF to check dimensions and calculate appropriate quality
+        pdf_document = fitz.open(stream=file_content, filetype="pdf")
+        if pdf_document.page_count > 0:
+            page = pdf_document[0]
+            rect = page.rect
+            width_pt = rect.width
+            height_pt = rect.height
+            
+            # Convert points to inches (72 points = 1 inch)
+            width_inches = width_pt / 72.0
+            height_inches = height_pt / 72.0
+            max_dimension_inches = max(width_inches, height_inches)
+            
+            # Calculate aspect ratio
+            aspect_ratio = max(width_inches, height_inches) / min(width_inches, height_inches)
+            
+            logger.info(
+                f"PDF page size: {width_inches:.1f}\" × {height_inches:.1f}\" "
+                f"({width_pt:.0f} × {height_pt:.0f} pt), aspect ratio: {aspect_ratio:.2f}:1"
+            )
+            
+            # Quick content analysis: Check if page has embedded images (raster content)
+            has_images = False
+            image_count = 0
+            try:
+                image_list = page.get_images(full=False)
+                image_count = len(image_list)
+                has_images = image_count > 0
+                if has_images:
+                    logger.info(f"PDF contains {image_count} embedded image(s) - likely a scanned floorplan")
+                else:
+                    logger.info("PDF is pure vector - likely a CAD drawing")
+            except Exception:
+                pass
+            
+            # File size heuristic: Small files are simple documents, large files are complex plans
+            is_complex_plan = file_size_mb > 0.5  # Files over 500KB are likely detailed plans
+            if is_complex_plan:
+                logger.info(f"Large file size ({file_size_mb:.2f} MB) indicates complex/detailed content")
+            else:
+                logger.info(f"Small file size ({file_size_mb:.2f} MB) indicates simple document")
+            
+            # INTELLIGENT SCALE SELECTION based on document characteristics
+            # Large architectural plans need high DPI for deep zoom
+            # Standard documents need moderate DPI for readability
+            
+            # Large architectural drawings (3+ feet)
+            # Use high scale for deep zoom capability
+            if max_dimension_inches >= 36:
+                target_scale = PDF_SCALE  # Keep 40x (2880 DPI)
+                reason = "large architectural plan (36+ inches)"
+            
+            # Medium architectural drawings (2-3 feet)
+            elif max_dimension_inches >= 24:
+                target_scale = min(PDF_SCALE, 30.0)  # Up to 30x (2160 DPI)
+                reason = "medium architectural plan (24-36 inches)"
+            
+            # Large format documents (tabloid/A3)
+            # Boost scale for complex/detailed plans (large file size)
+            elif max_dimension_inches >= 17:
+                if has_images:
+                    target_scale = min(PDF_SCALE, 15.0)  # 15x (1080 DPI) for scans
+                else:
+                    # Complex vector plans get higher DPI
+                    target_scale = min(PDF_SCALE, 30.0 if is_complex_plan else 20.0)
+                reason = "large format document (17-24 inches)"
+            
+            # Standard documents (letter/A4)
+            # Complex plans need more detail than simple documents
+            elif max_dimension_inches >= 11:
+                if has_images:
+                    target_scale = min(PDF_SCALE, 12.0)  # 12x (864 DPI) for scans
+                else:
+                    # Boost for complex vector plans with lots of detail
+                    target_scale = min(PDF_SCALE, 30.0 if is_complex_plan else 15.0)
+                reason = "standard document (11-17 inches)"
+            
+            # Small documents
+            else:
+                target_scale = min(PDF_SCALE, 10.0)  # Up to 10x (720 DPI)
+                reason = "small document (<11 inches)"
+            
+            # Content-based adjustment
+            if has_images:
+                reason += ", scanned/raster content"
+            else:
+                reason += ", vector/CAD content"
+            
+            if is_complex_plan and max_dimension_inches < 36:
+                reason += " (complex/detailed)"
+            
+            # Additional check: Extremely wide/tall aspect ratios (like long floorplans)
+            # need higher quality even if overall size is moderate
+            if aspect_ratio > 2.5 and max_dimension_inches >= 20:
+                target_scale = min(target_scale * 1.5, PDF_SCALE)
+                reason += " with extreme aspect ratio"
+            
+            # Final safety check: Don't exceed memory limits
+            potential_width = int(width_pt * target_scale)
+            potential_height = int(height_pt * target_scale)
+            potential_pixels = potential_width * potential_height
+            
+            MAX_SAFE_PIXELS = 300_000_000  # ~17,000 × 17,000 pixels
+            if potential_pixels > MAX_SAFE_PIXELS:
+                area_scale = (MAX_SAFE_PIXELS / potential_pixels) ** 0.5
+                target_scale = target_scale * area_scale
+                reason += " (reduced for memory safety)"
+            
+            if target_scale != PDF_SCALE:
+                logger.info(
+                    f"Smart scaling: Adjusted from {PDF_SCALE}x to {target_scale:.1f}x "
+                    f"for {reason}. Will create {int(width_pt * target_scale)}×{int(height_pt * target_scale)} "
+                    f"({int(width_pt * target_scale * height_pt * target_scale):,} pixels) at {target_scale * 72:.0f} DPI"
+                )
+            else:
+                logger.info(
+                    f"Using full scale {PDF_SCALE}x for {reason}. "
+                    f"Will create {potential_width}×{potential_height} ({potential_pixels:,} pixels) at {PDF_SCALE * 72:.0f} DPI"
+                )
+            
+            PDF_SCALE = target_scale
+        
+        pdf_document.close()
         
         # 1. Convert PDF to PNG (single page expected)
         update_job_progress(job_id, 15, "Converting PDF to image...")
