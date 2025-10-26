@@ -1051,7 +1051,7 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
                     target_scale = min(PDF_SCALE, 15.0)  # 15x (1080 DPI) for scans
                 else:
                     # Complex vector plans get higher DPI
-                    target_scale = min(PDF_SCALE, 30.0 if is_complex_plan else 20.0)
+                    target_scale = min(PDF_SCALE, 40.0 if is_complex_plan else 20.0)
                 reason = "large format document (17-24 inches)"
             
             # Standard documents (letter/A4)
@@ -1061,7 +1061,7 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
                     target_scale = min(PDF_SCALE, 12.0)  # 12x (864 DPI) for scans
                 else:
                     # Boost for complex vector plans with lots of detail
-                    target_scale = min(PDF_SCALE, 30.0 if is_complex_plan else 15.0)
+                    target_scale = min(PDF_SCALE, 40.0 if is_complex_plan else 15.0)
                 reason = "standard document (11-17 inches)"
             
             # Small documents
