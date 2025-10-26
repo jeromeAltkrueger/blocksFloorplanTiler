@@ -895,14 +895,21 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
         
         # Check if any floorplan already exists with this file_id
         prefix = f"floorplans/{file_id}-"
-        existing_blobs = list(container_client.list_blobs(name_starts_with=prefix, max_results=1))
+        existing_blob = None
         
-        if existing_blobs:
+        # Get iterator and check if any blob exists with this prefix
+        blob_iterator = container_client.list_blobs(name_starts_with=prefix)
+        try:
+            existing_blob = next(iter(blob_iterator), None)
+        except Exception as e:
+            logger.warning(f"Error checking for existing blobs: {e}")
+        
+        if existing_blob:
             # Found existing floorplan with this file_id, skip processing
             logger.info(f"Floorplan already exists for file_id {file_id}, skipping processing")
             
             # Extract the existing floorplan_id from the first blob path
-            existing_blob_path = existing_blobs[0].name
+            existing_blob_path = existing_blob.name
             existing_floorplan_id = existing_blob_path.split('/')[1]
             
             return {
