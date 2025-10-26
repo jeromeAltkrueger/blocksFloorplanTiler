@@ -939,7 +939,7 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
         # 🗺️ TILING CONFIGURATION - DEEP ZOOM MODE:
         MAX_ZOOM_LIMIT = 12      # Maximum zoom levels allowed
         FORCED_MAX_Z_ENV = int(os.environ.get('FORCED_MAX_Z', '-1'))  # -1 = auto-calculate based on image size
-        ZOOM_BOOST = int(os.environ.get('ZOOM_BOOST', '3'))  # Add extra zoom levels beyond native (for deep zoom with upscaling)
+        ZOOM_BOOST = int(os.environ.get('ZOOM_BOOST', '4'))  # Add extra zoom levels beyond native (for deep zoom with upscaling)
         TILE_SIZE_ENV = int(os.environ.get('TILE_SIZE', '512'))  # 512px tiles
         MIN_ZOOM_ENV = int(os.environ.get('MIN_ZOOM', '0'))  # Start from zoom level 0
         
