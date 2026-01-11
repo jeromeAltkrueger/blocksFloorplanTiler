@@ -48,10 +48,15 @@ jobs:
             --file Dockerfile \
             .
           
-          # Update Container App with new image
+          # Update Container App with new image and environment variables
           az containerapp update \
             --name blockstilingservice \
             --resource-group KompassExperimental \
-            --image ca285afb5d06acr.azurecr.io/blockstilingservice:${IMAGE_TAG}
+            --image ca285afb5d06acr.azurecr.io/blockstilingservice:${IMAGE_TAG} \
+            --set-env-vars \
+              AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=blocksplayground;AccountKey=kkEgPRG9ve1s/1mv/xNXdMwpd4Yp7tQVnweFnQvbWCK45khrlyJJnhLVKKZXB8BS/fzhRIPkYtEO+AStKbWzrw==;EndpointSuffix=core.windows.net" \
+              TEST_STORAGE_ACCOUNT_NAME="blocksplayground" \
+              PRODUCTION_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=productionstorageblocks;AccountKey=d0WDrWnXsj+g9K8onIBIMSB/kYIiC0sraJVxkDJiZdRuN60CE6ojMojUD8VIdEUOaA/4kDz3G3ge+AStM5ceEw==;EndpointSuffix=core.windows.net" \
+              PRODUCTION_STORAGE_ACCOUNT_NAME="productionstorageblocks"
 
 

@@ -33,6 +33,13 @@ Image.MAX_IMAGE_PIXELS = None
 # API Key configuration
 API_KEY = os.environ.get("API_KEY", "")  # Set via environment variable
 
+# Storage configuration
+TEST_STORAGE_CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")  # Test/dev storage
+TEST_STORAGE_ACCOUNT_NAME = os.environ.get("TEST_STORAGE_ACCOUNT_NAME", "blocksplayground")  # Default test account
+
+PRODUCTION_STORAGE_CONNECTION_STRING = os.environ.get("PRODUCTION_STORAGE_CONNECTION_STRING")  # Production storage
+PRODUCTION_STORAGE_ACCOUNT_NAME = os.environ.get("PRODUCTION_STORAGE_ACCOUNT_NAME")  # Production account name
+
 def verify_api_key(x_api_key: str = Header(None)):
     """Verify the API key from request header"""
     if not API_KEY:
@@ -75,6 +82,7 @@ app = FastAPI(
 class ProcessFloorplanRequest(BaseModel):
     file_url: str
     file_id: int
+    environment: str = "test"  # "test" or "production" - controls which storage account to use
 
 
 class MassDeleteFloorplanRequest(BaseModel):
@@ -744,7 +752,7 @@ def update_job_progress(job_id: str, progress: int, message: str):
             jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
 
 
-def process_floorplan_background(job_id: str, file_url: str, file_id: int):
+def process_floorplan_background(job_id: str, file_url: str, file_id: int, environment: str = "test"):
     """Background task to process the floorplan"""
     try:
         # Update status to processing
@@ -753,7 +761,7 @@ def process_floorplan_background(job_id: str, file_url: str, file_id: int):
             jobs_store[job_id]["updated_at"] = datetime.utcnow().isoformat()
         
         # Call the synchronous processing logic
-        result = process_floorplan_sync(file_url, job_id, file_id)
+        result = process_floorplan_sync(file_url, job_id, file_id, environment)
         
         # Mark as completed
         with jobs_lock:
@@ -802,9 +810,9 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
         }
     
     # Start background processing
-    background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.file_id)
+    background_tasks.add_task(process_floorplan_background, job_id, request.file_url, request.file_id, request.environment)
     
-    logger.info(f"Job {job_id} queued for processing")
+    logger.info(f"Job {job_id} queued for processing (environment: {request.environment})")
     
     return {
         "job_id": job_id,
@@ -814,7 +822,7 @@ async def process_floorplan(request: ProcessFloorplanRequest, background_tasks: 
     }
 
 
-def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
+def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment: str = "test"):
     """
     Synchronous processing logic (moved from original async endpoint).
     Updates job progress throughout processing.
@@ -823,21 +831,42 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
         file_url: URL of the PDF to process
         job_id: Job ID for progress tracking
         file_id: File ID (required)
+        environment: "test" or "production" - determines which storage account to use
         
     Returns:
         Result dictionary with floorplan info
     """
     update_job_progress(job_id, 5, "Downloading PDF...")
-    logger.info(f"Job {job_id}: Processing floorplan from URL: {file_url}")
+    logger.info(f"Job {job_id}: Processing floorplan from URL: {file_url} (environment: {environment})")
+    
+    # Determine storage configuration based on environment
+    if environment.lower() == "production":
+        if not PRODUCTION_STORAGE_CONNECTION_STRING or not PRODUCTION_STORAGE_ACCOUNT_NAME:
+            raise HTTPException(
+                status_code=500,
+                detail="Production storage not configured. Please set PRODUCTION_STORAGE_CONNECTION_STRING and PRODUCTION_STORAGE_ACCOUNT_NAME environment variables."
+            )
+        connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
+        storage_account_name = PRODUCTION_STORAGE_ACCOUNT_NAME
+        logger.info(f"Using PRODUCTION storage account: {storage_account_name}")
+    else:
+        if not TEST_STORAGE_CONNECTION_STRING:
+            raise HTTPException(
+                status_code=500,
+                detail="Test storage connection string not configured"
+            )
+        connection_string = TEST_STORAGE_CONNECTION_STRING
+        storage_account_name = TEST_STORAGE_ACCOUNT_NAME
+        logger.info(f"Using TEST storage account: {storage_account_name}")
     
     try:
         # Download the PDF from Azure Blob Storage or URL
         try:
             # Check if it's an Azure Blob Storage URL
             if 'blob.core.windows.net' in file_url:
-                # Use Azure SDK to download from blob storage
-                connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-                if not connection_string:
+                # Use Azure SDK to download from blob storage (use source storage, not destination)
+                download_connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+                if not download_connection_string:
                     raise Exception("Storage connection string not configured")
                 
                 # Parse the blob URL to extract container and blob name
@@ -850,7 +879,7 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
                 
                 logger.info(f"Downloading from Azure Blob: container={container_name}, blob={blob_name}")
                 
-                blob_service = BlobServiceClient.from_connection_string(connection_string)
+                blob_service = BlobServiceClient.from_connection_string(download_connection_string)
                 blob_client = blob_service.get_blob_client(container_name, blob_name)
                 file_content = blob_client.download_blob().readall()
                 logger.info(f"Downloaded PDF from blob storage: {len(file_content)} bytes")
@@ -882,14 +911,6 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
         # Create floorplan ID - just use file_id as folder name
         floorplan_id = str(file_id)
         
-        # Check if floorplan already exists
-        connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        if not connection_string:
-            raise HTTPException(
-                status_code=500,
-                detail="Storage connection string not configured"
-            )
-        
         blob_service = BlobServiceClient.from_connection_string(connection_string)
         container_client = blob_service.get_container_client("blocks")
         
@@ -916,10 +937,11 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
                 "success": True,
                 "message": "Floorplan already exists for this file_id",
                 "floorplan_id": existing_floorplan_id,
+                "environment": environment,
                 "urls": {
-                    "metadata": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/metadata.json",
-                    "preview": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/preview.jpg",
-                    "tiles": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
+                    "metadata": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/metadata.json",
+                    "preview": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/preview.jpg",
+                    "tiles": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{existing_floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
                 }
             }
         
@@ -1263,6 +1285,8 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
         return {
             "success": True,
             "floorplan_id": floorplan_id,
+            "environment": environment,
+            "storage_account": storage_account_name,
             "dimensions": {
                 "width": floor_plan_image.width,
                 "height": floor_plan_image.height
@@ -1278,9 +1302,9 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int):
                 "tile_size": tile_size
             },
             "urls": {
-                "metadata": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/metadata.json",
-                "preview": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/preview.png",
-                "tiles": f"https://blocksplayground.blob.core.windows.net/blocks/floorplans/{floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
+                "metadata": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/metadata.json",
+                "preview": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/preview.png",
+                "tiles": f"https://{storage_account_name}.blob.core.windows.net/blocks/floorplans/{floorplan_id}/tiles/{{z}}/{{x}}/{{y}}.png"
             }
         }
         
