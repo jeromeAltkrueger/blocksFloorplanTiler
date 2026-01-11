@@ -864,20 +864,27 @@ def process_floorplan_sync(file_url: str, job_id: str, file_id: int, environment
         try:
             # Check if it's an Azure Blob Storage URL
             if 'blob.core.windows.net' in file_url:
-                # Use Azure SDK to download from blob storage (use source storage, not destination)
-                download_connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-                if not download_connection_string:
-                    raise Exception("Storage connection string not configured")
-                
-                # Parse the blob URL to extract container and blob name
+                # Parse the blob URL to extract storage account, container and blob name
                 from urllib.parse import urlparse
                 parsed_url = urlparse(file_url)
                 # URL format: https://<account>.blob.core.windows.net/<container>/<blob-path>
+                source_storage_account = parsed_url.hostname.split('.')[0] if parsed_url.hostname else ''
                 path_parts = parsed_url.path.lstrip('/').split('/', 1)
                 container_name = path_parts[0]
                 blob_name = path_parts[1] if len(path_parts) > 1 else ''
                 
-                logger.info(f"Downloading from Azure Blob: container={container_name}, blob={blob_name}")
+                logger.info(f"Downloading from Azure Blob: account={source_storage_account}, container={container_name}, blob={blob_name}")
+                
+                # Determine which connection string to use based on source storage account
+                if source_storage_account.lower() == PRODUCTION_STORAGE_ACCOUNT_NAME.lower() if PRODUCTION_STORAGE_ACCOUNT_NAME else False:
+                    download_connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
+                    logger.info(f"Using PRODUCTION storage credentials to download source file")
+                else:
+                    download_connection_string = TEST_STORAGE_CONNECTION_STRING
+                    logger.info(f"Using TEST storage credentials to download source file")
+                
+                if not download_connection_string:
+                    raise Exception(f"Storage connection string not configured for source account: {source_storage_account}")
                 
                 blob_service = BlobServiceClient.from_connection_string(download_connection_string)
                 blob_client = blob_service.get_blob_client(container_name, blob_name)
