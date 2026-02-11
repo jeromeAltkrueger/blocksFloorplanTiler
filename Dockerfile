@@ -43,6 +43,7 @@ WORKDIR /app
 
 # Copy application code
 COPY app.py .
+COPY pdf_annotation.py .
 
 # Create non-root user for security
 RUN useradd -m -u 1000 appuser && \
