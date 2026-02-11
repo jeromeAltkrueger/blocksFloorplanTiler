@@ -13,8 +13,12 @@ import os
 app = func.FunctionApp()
 
 # Import and register PDF annotation routes
-import pdf_annotation
-pdf_annotation.register_routes(app)
+try:
+    import pdf_annotation
+    pdf_annotation.register_routes(app)
+    logging.info("✅ PDF annotation routes registered")
+except Exception as e:
+    logging.error(f"❌ Failed to register pdf_annotation routes: {e}", exc_info=True)
 
 
 def pdf_to_images(pdf_content: bytes, scale: float = 2.0, max_dimension: int = 20000) -> List[Image.Image]:
