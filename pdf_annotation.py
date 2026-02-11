@@ -80,14 +80,14 @@ def detect_trim_offset(page: fitz.Page, metadata: Dict[str, Any]) -> Tuple[float
     Detect the whitespace trim offset by comparing PDF page dimensions
     with the stored image dimensions. If trimming occurred, re-render at
     low resolution to find the exact content origin.
-    
+
     Uses the same logic as trim_whitespace() in app.py:
     - bg_color=(255,255,255), tolerance=10, padding=20 pixels
-    
+
     Args:
         page: PyMuPDF page object (original PDF)
         metadata: Metadata with source_image dimensions and pdf_scale
-    
+
     Returns:
         (trim_left, trim_top) in pixels at pdf_scale resolution.
         These are the pixel offsets that were cropped from the pre-trim image.
@@ -95,61 +95,61 @@ def detect_trim_offset(page: fitz.Page, metadata: Dict[str, Any]) -> Tuple[float
     pdf_scale = metadata["quality_settings"]["pdf_scale"]
     img_w = metadata["source_image"]["width"]
     img_h = metadata["source_image"]["height"]
-    
+
     # Pre-trim image dimensions
     pretrim_w = page.rect.width * pdf_scale
     pretrim_h = page.rect.height * pdf_scale
-    
+
     # Check if trimming occurred (allow 1px tolerance for rounding)
     if abs(pretrim_w - img_w) <= 1 and abs(pretrim_h - img_h) <= 1:
         logging.info("No whitespace trimming detected — using direct formula")
         return (0.0, 0.0)
-    
+
     logging.info(f"Whitespace trimming detected!")
     logging.info(f"  Pre-trim:  {pretrim_w:.0f} x {pretrim_h:.0f} px")
     logging.info(f"  Post-trim: {img_w} x {img_h} px")
     logging.info(f"  Trimmed:   {pretrim_w - img_w:.0f} x {pretrim_h - img_h:.0f} px")
-    
+
     # Re-render at low resolution to detect content bbox
     # Use scale 2.0 (144 DPI) — fast and accurate enough for bbox detection
     detect_scale = 2.0
     pix = page.get_pixmap(matrix=fitz.Matrix(detect_scale, detect_scale), alpha=False)
     pil_img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-    
+
     # Same detection logic as trim_whitespace in app.py
     bg = Image.new("RGB", pil_img.size, (255, 255, 255))
     diff = ImageChops.difference(pil_img, bg).convert("L")
     mask = diff.point(lambda p: 255 if p > 10 else 0)  # tolerance=10
     bbox = mask.getbbox()
-    
+
     pil_img.close()
-    
+
     if not bbox:
         logging.warning("Could not detect content bbox — using (0, 0) offset")
         return (0.0, 0.0)
-    
+
     # bbox is (left, top, right, bottom) in detect_scale pixels
     # Apply same padding as trim_whitespace: 20 pixels at pdf_scale
     # At detect_scale, padding = 20 * detect_scale / pdf_scale
     padding_at_detect = 20 * detect_scale / pdf_scale
-    
+
     left_detect = max(0, bbox[0] - padding_at_detect)
     top_detect = max(0, bbox[1] - padding_at_detect)
-    
+
     # Convert from detect_scale pixels to pdf_scale pixels
     trim_left = left_detect * pdf_scale / detect_scale
     trim_top = top_detect * pdf_scale / detect_scale
-    
+
     logging.info(f"  Content bbox at {detect_scale}x: left={bbox[0]}, top={bbox[1]}")
     logging.info(f"  Trim offset (at pdf_scale): left={trim_left:.1f}, top={trim_top:.1f} px")
-    
+
     # Verify: post-trim dimensions should roughly match metadata
     right_detect = min(pix.width, bbox[2] + padding_at_detect)
     bottom_detect = min(pix.height, bbox[3] + padding_at_detect)
     detected_w = (right_detect - left_detect) * pdf_scale / detect_scale
     detected_h = (bottom_detect - top_detect) * pdf_scale / detect_scale
     logging.info(f"  Detected content size: {detected_w:.0f} x {detected_h:.0f} px (metadata: {img_w} x {img_h})")
-    
+
     return (trim_left, trim_top)
 
 
@@ -157,12 +157,12 @@ def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any],
                      trim_offset: Tuple[float, float] = (0.0, 0.0)) -> Tuple[float, float]:
     """
     Transform Leaflet CRS.Simple coordinates to PyMuPDF PDF coordinates.
-    
+
     Args:
         leaflet_coords: [x, y] where x=lng (positive), y=lat (negative)
         metadata: Must contain 'max_zoom' and 'quality_settings.pdf_scale'
         trim_offset: (trim_left, trim_top) in pixels at pdf_scale resolution
-    
+
     Returns:
         (pdf_x, pdf_y) in PyMuPDF coordinate space (top-left origin, Y down)
     """
@@ -170,11 +170,11 @@ def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any],
     scale = 2 ** metadata["max_zoom"]
     pdf_scale = metadata["quality_settings"]["pdf_scale"]
     trim_left, trim_top = trim_offset
-    
+
     # Leaflet → trimmed image pixels → pre-trim image pixels → PDF points
     pdf_x = (x * scale + trim_left) / pdf_scale
     pdf_y = (-y * scale + trim_top) / pdf_scale
-    
+
     return (pdf_x, pdf_y)
 
 
@@ -239,7 +239,7 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     """
     x, y = coordinates[0], coordinates[1]
     logging.info(f"Drawing marker at [{x}, {y}]")
-    
+
     # Convert to PDF coordinates
     x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
     # Draw circle
