@@ -1343,9 +1343,51 @@ async def pdf_annotation_endpoint(request: PdfAnnotationRequest,
                                   api_key_valid: bool = Depends(verify_api_key)):
     """
     Annotate a PDF with shapes and markers from Leaflet drawings.
-    Downloads the PDF and metadata, applies annotations, uploads to blob storage.
+
+    Request body:
+    {
+        "file_url": "https://example.com/floorplan.pdf",
+        "metadata_url": "https://example.com/floorplan/metadata.json",
+        "objects": [
+            {
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [[[lat, lon], ...]]},
+                "properties": {"type": "rectangle"}
+            },
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lat, lon]},
+                "properties": {"type": "marker", "content": "Label"}
+            }
+        ],
+        "environment": "test"
+    }
+
+    Returns:
+    {
+        "success": true,
+        "annotated_pdf_url": "https://...",
+        "filename": "floorplan-annotation-[timestamp].pdf"
+    }
     """
     try:
+        # Validate required fields
+        file_url = request.file_url
+        metadata_url = request.metadata_url
+        objects = request.objects or []
+
+        if not file_url:
+            raise HTTPException(status_code=400, detail="file_url is required")
+
+        if not metadata_url:
+            raise HTTPException(status_code=400, detail="metadata_url is required")
+
+        logger.info(f"📝 Starting PDF annotation")
+        logger.info(f"   PDF URL: {file_url}")
+        logger.info(f"   Metadata URL: {metadata_url}")
+        logger.info(f"   Objects to draw: {len(objects)}")
+
+        # Determine storage configuration based on environment
         environment = request.environment
         if environment == "production" and PRODUCTION_STORAGE_CONNECTION_STRING:
             connection_string = PRODUCTION_STORAGE_CONNECTION_STRING
@@ -1355,38 +1397,46 @@ async def pdf_annotation_endpoint(request: PdfAnnotationRequest,
             storage_account_name = TEST_STORAGE_ACCOUNT_NAME
 
         if not connection_string:
-            raise HTTPException(status_code=500, detail="Storage connection string not configured")
+            raise HTTPException(status_code=500, detail="Azure Storage connection string not configured")
 
-        # Download metadata and PDF
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            logger.info(f"Downloading metadata: {request.metadata_url}")
-            meta_resp = await client.get(request.metadata_url)
-            meta_resp.raise_for_status()
-            metadata = meta_resp.json()
+        # Download metadata
+        logger.info("⬇️ Downloading metadata...")
+        metadata_bytes = await pdf_annotation.download_file(metadata_url)
+        metadata = json.loads(metadata_bytes.decode('utf-8'))
+        logger.info(f"✅ Metadata loaded: {metadata.get('floorplan_id')}")
 
-            logger.info(f"Downloading PDF: {request.file_url}")
-            pdf_resp = await client.get(request.file_url)
-            pdf_resp.raise_for_status()
-            pdf_bytes = pdf_resp.content
+        # Download PDF
+        logger.info("⬇️ Downloading PDF...")
+        pdf_bytes = await pdf_annotation.download_file(file_url)
+        logger.info(f"✅ PDF downloaded: {len(pdf_bytes)} bytes")
 
-        logger.info(f"Annotating PDF with {len(request.objects)} objects...")
-        annotated_pdf_bytes = pdf_annotation.annotate_pdf(pdf_bytes, request.objects, metadata)
+        # Annotate PDF
+        logger.info("🎨 Annotating PDF...")
+        annotated_pdf_bytes = pdf_annotation.annotate_pdf(pdf_bytes, objects, metadata)
+        logger.info(f"✅ PDF annotated: {len(annotated_pdf_bytes)} bytes")
 
-        # Generate filename and upload
+        # Generate filename with timestamp
         timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        original_filename = request.file_url.split("/")[-1].rsplit(".", 1)[0]
+
+        # Extract original filename without extension
+        original_filename = file_url.split("/")[-1].rsplit(".", 1)[0]
         annotated_filename = f"{original_filename}-annotation-{timestamp}.pdf"
 
-        container_name = "annotated-pdfs"
+        # Upload to Azure Blob Storage
+        logger.info("☁️ Uploading to Azure Blob Storage...")
         blob_service = BlobServiceClient.from_connection_string(connection_string)
 
+        # Upload to 'annotated-pdfs' container
+        container_name = "annotated-pdfs"
         try:
             container_client = blob_service.get_container_client(container_name)
             container_client.get_container_properties()
         except Exception:
+            # Create container if it doesn't exist
             container_client = blob_service.create_container(container_name, public_access="blob")
             logger.info(f"Created container: {container_name}")
 
+        # Upload the annotated PDF
         blob_client = blob_service.get_blob_client(container_name, annotated_filename)
         blob_client.upload_blob(
             annotated_pdf_bytes,
@@ -1394,27 +1444,31 @@ async def pdf_annotation_endpoint(request: PdfAnnotationRequest,
             content_settings=ContentSettings(content_type="application/pdf")
         )
 
+        # Generate the public URL
         annotated_pdf_url = f"https://{storage_account_name}.blob.core.windows.net/{container_name}/{annotated_filename}"
-        logger.info(f"Annotated PDF uploaded: {annotated_pdf_url}")
 
+        logger.info(f"✅ Upload complete!")
+        logger.info(f"   URL: {annotated_pdf_url}")
+
+        # Return success response
         return {
             "success": True,
             "annotated_pdf_url": annotated_pdf_url,
             "filename": annotated_filename,
-            "objects_drawn": len(request.objects),
+            "objects_drawn": len(objects),
             "metadata": {
                 "floorplan_id": metadata.get("floorplan_id"),
-                "source_url": request.file_url
+                "source_url": file_url
             }
         }
 
     except httpx.HTTPError as e:
-        logger.error(f"Download error: {str(e)}")
+        logger.error(f"❌ Download error: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error annotating PDF: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error annotating PDF: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error annotating PDF: {str(e)}")
 
 
