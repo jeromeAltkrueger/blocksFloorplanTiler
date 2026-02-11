@@ -1,14 +1,15 @@
-import azure.functions as func
-import logging
-import pypdfium2 as pdfium
-from PIL import Image, ImageChops
-from typing import List, Tuple, Dict
 import io
 import json
-from datetime import datetime
-from azure.storage.blob import BlobServiceClient, ContentSettings
+import logging
 import math
 import os
+from datetime import datetime
+from typing import Dict, List, Tuple
+
+import azure.functions as func
+import pypdfium2 as pdfium
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from PIL import Image, ImageChops
 
 app = func.FunctionApp()
 
