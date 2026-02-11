@@ -8,7 +8,7 @@ on:
       [ main ]
     paths:
     - '**'
-    - '.github/workflows/blockstilingservice-AutoDeployTrigger-fe80fb0c-ad04-4b22-8334-616c77ad7e8b.yml'
+    - '.github/workflows/blockstilingservice-AutoDeployTrigger-b7f77713-4096-4e3c-abd2-8ef9bcb2e0c1.yml'
 
   # Allow manual trigger 
   workflow_dispatch:      
@@ -31,19 +31,30 @@ jobs:
           tenant-id: ${{ secrets.BLOCKSTILINGSERVICE_AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.BLOCKSTILINGSERVICE_AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and push container image to registry
-        uses: azure/container-apps-deploy-action@v2
-        with:
-          appSourcePath: ${{ github.workspace }}
-          _dockerfilePathKey_: _dockerfilePath_
-          _targetLabelKey_: _targetLabel_
-          registryUrl: ca285afb5d06acr.azurecr.io
-          registryUsername: ${{ secrets.BLOCKSTILINGSERVICE_REGISTRY_USERNAME }}
-          registryPassword: ${{ secrets.BLOCKSTILINGSERVICE_REGISTRY_PASSWORD }}
-          containerAppName: blockstilingservice
-          resourceGroup: KompassExperimental
-          imageToBuild: ca285afb5d06acr.azurecr.io/blockstilingservice:${{ github.sha }}
-          _buildArgumentsKey_: |
-            _buildArgumentsValues_
-
-
+      - name: Build and deploy to Azure Container Apps
+        run: |
+          # Ensure Container App has system-assigned managed identity
+          az containerapp identity assign \
+            --name blockstilingservice \
+            --resource-group KompassExperimental \
+            --system-assigned || true
+          
+          # Build container image in ACR
+          IMAGE_TAG=$(date +%Y%m%d%H%M%S)
+          az acr build \
+            --registry ca285afb5d06acr \
+            --image blockstilingservice:${IMAGE_TAG} \
+            --image blockstilingservice:latest \
+            --file Dockerfile \
+            .
+          
+          # Update Container App with new image and environment variables
+          az containerapp update \
+            --name blockstilingservice \
+            --resource-group KompassExperimental \
+            --image ca285afb5d06acr.azurecr.io/blockstilingservice:${IMAGE_TAG} \
+            --set-env-vars \
+              AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=blocksplayground;AccountKey=kkEgPRG9ve1s/1mv/xNXdMwpd4Yp7tQVnweFnQvbWCK45khrlyJJnhLVKKZXB8BS/fzhRIPkYtEO+AStKbWzrw==;EndpointSuffix=core.windows.net" \
+              TEST_STORAGE_ACCOUNT_NAME="blocksplayground" \
+              PRODUCTION_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=productionstorageblocks;AccountKey=d0WDrWnXsj+g9K8onIBIMSB/kYIiC0sraJVxkDJiZdRuN60CE6ojMojUD8VIdEUOaA/4kDz3G3ge+AStM5ceEw==;EndpointSuffix=core.windows.net" \
+              PRODUCTION_STORAGE_ACCOUNT_NAME="productionstorageblocks"
