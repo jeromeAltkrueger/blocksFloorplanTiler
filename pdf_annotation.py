@@ -24,23 +24,23 @@ from PIL import Image, ImageChops
 ANNOTATION_CONFIG = {
     "polygon": {
         "fill_color": (1, 0, 0),      # Red (RGB normalized 0-1)
-        "fill_opacity": 0.4,
+        "fill_opacity": 0.2,
         "stroke_color": (1, 0, 0),
-        "stroke_width": 8,
+        "stroke_width": 1,
         "stroke_opacity": 1.0
     },
     "marker": {
         "fill_color": (1, 0, 0),
-        "fill_opacity": 0.8,
-        "radius": 20,
+        "fill_opacity": 0.2,
+        "radius": 4,
         "stroke_color": (0, 0, 0),
-        "stroke_width": 3
+        "stroke_width": 1
     },
     "square": {
         "fill_color": (1, 0, 0),
-        "fill_opacity": 0.4,
+        "fill_opacity": 0.25,
         "stroke_color": (1, 0, 0),
-        "stroke_width": 8,
+        "stroke_width": 1,
         "stroke_opacity": 1.0
     },
     "text": {
@@ -225,16 +225,18 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
 def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
                        metadata: Dict[str, Any], config: Dict[str, Any],
                        label: str = None,
+                       overlay: str = None,
                        trim_offset: Tuple[float, float] = (0.0, 0.0)) -> None:
     """
-    Draw a circular marker on the PDF page.
+    Draw a circular marker on the PDF page, optionally with centered overlay text.
 
     Args:
         page: PyMuPDF page object
         coordinates: [x, y] point coordinates
         metadata: Metadata for coordinate transformation
         config: Styling configuration
-        label: Optional text label
+        label: Optional text label (drawn below the marker)
+        overlay: Optional text centered inside the marker circle
         trim_offset: (trim_left, trim_top) whitespace offset in pixels
     """
     x, y = coordinates[0], coordinates[1]
@@ -242,9 +244,18 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
 
     # Convert to PDF coordinates
     x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
+    radius = config["radius"]
+
+    # If overlay text is provided, scale the circle to fit the text
+    if overlay:
+        font_size = min(radius * 0.5, 4)  # Keep text very small
+        # Estimate text width and ensure circle is large enough
+        text_width = len(overlay) * font_size * 0.5
+        min_radius = max(radius, text_width / 2 + 4, font_size / 2 + 4)
+        radius = min_radius
+
     # Draw circle
     shape = page.new_shape()
-    radius = config["radius"]
     shape.draw_circle(fitz.Point(x_pdf, y_pdf), radius)
     shape.finish(
         fill=config["fill_color"],
@@ -254,9 +265,23 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     )
     shape.commit()
 
-    logging.info(f"✅ Marker drawn!")
+    # Draw centered overlay text inside the circle
+    if overlay:
+        # Calculate text position to center it
+        text_width = fitz.get_text_length(overlay, fontsize=font_size)
+        text_x = x_pdf - text_width / 2
+        text_y = y_pdf + font_size / 3  # Baseline offset for visual centering
+        page.insert_text(
+            fitz.Point(text_x, text_y),
+            overlay,
+            fontsize=font_size,
+            color=(0, 0, 1)  # Blue text on red circle
+        )
+        logging.info(f"✅ Marker drawn with overlay: '{overlay}'")
+    else:
+        logging.info(f"✅ Marker drawn!")
 
-    # Draw label if provided
+    # Draw label below if provided
     if label:
         text_config = ANNOTATION_CONFIG["text"]
         draw_text_on_pdf(page, [x_pdf, y_pdf + radius + 5], label, text_config)
@@ -388,7 +413,8 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             elif obj_type == "marker" or geo_type == "Point":
                 config = ANNOTATION_CONFIG["marker"]
                 label = obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
-                draw_marker_on_pdf(page, coordinates, metadata, config, label, trim_offset)
+                overlay = obj.get("overlay")
+                draw_marker_on_pdf(page, coordinates, metadata, config, label, overlay, trim_offset)
                 objects_drawn += 1
 
             else:
