@@ -13,6 +13,7 @@ from datetime import datetime
 from azure.storage.blob import BlobServiceClient, ContentSettings
 import os
 import httpx
+from PIL import Image, ImageChops
 
 
 # ==========================================
@@ -56,50 +57,130 @@ ANNOTATION_CONFIG = {
 # COORDINATE TRANSFORMATION
 # ==========================================
 #
-# Pipeline: PDF → Image → Leaflet (forward)
+# Forward pipeline (tile generation in app.py):
 #   1. PDF → Image:  pixel = pdf_pt × pdf_scale        (fitz.Matrix)
-#   2. Image → Leaflet:  lng = pixel_x / 2^maxZoom
-#                         lat = -pixel_y / 2^maxZoom    (CRS.Simple)
+#   2. Trim whitespace: crops margins, shifts origin     (trim_whitespace)
+#   3. Image → Leaflet:  lng = pixel_x / 2^maxZoom      (CRS.Simple)
+#                         lat = -pixel_y / 2^maxZoom
 #
-# Pipeline: Leaflet → PDF (reverse, what we need)
-#   1. Leaflet → Image:  pixel_x = lng × 2^maxZoom
-#                         pixel_y = -lat × 2^maxZoom
-#   2. Image → PDF:  pdf_pt = pixel / pdf_scale
+# Reverse pipeline (what we need for annotations):
+#   1. Leaflet → trimmed image pixels
+#   2. Add trim offset → original (pre-trim) image pixels
+#   3. Divide by pdf_scale → PDF points
 #
-# Combined:
-#   pdf_x = leaflet_x × 2^maxZoom / pdf_scale
-#   pdf_y = (-leaflet_y) × 2^maxZoom / pdf_scale
+# Formula:
+#   pdf_x = (leaflet_x × 2^maxZoom + trim_left) / pdf_scale
+#   pdf_y = (-leaflet_y × 2^maxZoom + trim_top) / pdf_scale
 #
-# Notes:
-#   - scale = 2^maxZoom (from Leaflet CRS.Simple), NOT tileSize
-#   - pdf_scale = metadata.quality_settings.pdf_scale
-#   - No Y-flip: both PyMuPDF and image pixels use top-left origin
-#   - Leaflet Y is negative (lat = -pixel_y / scale), negating restores it
+# When no trimming occurred: trim_left=0, trim_top=0, simplifies to old formula
 # ==========================================
 
-def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any]) -> Tuple[float, float]:
+def detect_trim_offset(page: fitz.Page, metadata: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Detect the whitespace trim offset by comparing PDF page dimensions
+    with the stored image dimensions. If trimming occurred, re-render at
+    low resolution to find the exact content origin.
+    
+    Uses the same logic as trim_whitespace() in app.py:
+    - bg_color=(255,255,255), tolerance=10, padding=20 pixels
+    
+    Args:
+        page: PyMuPDF page object (original PDF)
+        metadata: Metadata with source_image dimensions and pdf_scale
+    
+    Returns:
+        (trim_left, trim_top) in pixels at pdf_scale resolution.
+        These are the pixel offsets that were cropped from the pre-trim image.
+    """
+    pdf_scale = metadata["quality_settings"]["pdf_scale"]
+    img_w = metadata["source_image"]["width"]
+    img_h = metadata["source_image"]["height"]
+    
+    # Pre-trim image dimensions
+    pretrim_w = page.rect.width * pdf_scale
+    pretrim_h = page.rect.height * pdf_scale
+    
+    # Check if trimming occurred (allow 1px tolerance for rounding)
+    if abs(pretrim_w - img_w) <= 1 and abs(pretrim_h - img_h) <= 1:
+        logging.info("No whitespace trimming detected — using direct formula")
+        return (0.0, 0.0)
+    
+    logging.info(f"Whitespace trimming detected!")
+    logging.info(f"  Pre-trim:  {pretrim_w:.0f} x {pretrim_h:.0f} px")
+    logging.info(f"  Post-trim: {img_w} x {img_h} px")
+    logging.info(f"  Trimmed:   {pretrim_w - img_w:.0f} x {pretrim_h - img_h:.0f} px")
+    
+    # Re-render at low resolution to detect content bbox
+    # Use scale 2.0 (144 DPI) — fast and accurate enough for bbox detection
+    detect_scale = 2.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(detect_scale, detect_scale), alpha=False)
+    pil_img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    
+    # Same detection logic as trim_whitespace in app.py
+    bg = Image.new("RGB", pil_img.size, (255, 255, 255))
+    diff = ImageChops.difference(pil_img, bg).convert("L")
+    mask = diff.point(lambda p: 255 if p > 10 else 0)  # tolerance=10
+    bbox = mask.getbbox()
+    
+    pil_img.close()
+    
+    if not bbox:
+        logging.warning("Could not detect content bbox — using (0, 0) offset")
+        return (0.0, 0.0)
+    
+    # bbox is (left, top, right, bottom) in detect_scale pixels
+    # Apply same padding as trim_whitespace: 20 pixels at pdf_scale
+    # At detect_scale, padding = 20 * detect_scale / pdf_scale
+    padding_at_detect = 20 * detect_scale / pdf_scale
+    
+    left_detect = max(0, bbox[0] - padding_at_detect)
+    top_detect = max(0, bbox[1] - padding_at_detect)
+    
+    # Convert from detect_scale pixels to pdf_scale pixels
+    trim_left = left_detect * pdf_scale / detect_scale
+    trim_top = top_detect * pdf_scale / detect_scale
+    
+    logging.info(f"  Content bbox at {detect_scale}x: left={bbox[0]}, top={bbox[1]}")
+    logging.info(f"  Trim offset (at pdf_scale): left={trim_left:.1f}, top={trim_top:.1f} px")
+    
+    # Verify: post-trim dimensions should roughly match metadata
+    right_detect = min(pix.width, bbox[2] + padding_at_detect)
+    bottom_detect = min(pix.height, bbox[3] + padding_at_detect)
+    detected_w = (right_detect - left_detect) * pdf_scale / detect_scale
+    detected_h = (bottom_detect - top_detect) * pdf_scale / detect_scale
+    logging.info(f"  Detected content size: {detected_w:.0f} x {detected_h:.0f} px (metadata: {img_w} x {img_h})")
+    
+    return (trim_left, trim_top)
+
+
+def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any],
+                     trim_offset: Tuple[float, float] = (0.0, 0.0)) -> Tuple[float, float]:
     """
     Transform Leaflet CRS.Simple coordinates to PyMuPDF PDF coordinates.
-
+    
     Args:
         leaflet_coords: [x, y] where x=lng (positive), y=lat (negative)
         metadata: Must contain 'max_zoom' and 'quality_settings.pdf_scale'
-
+        trim_offset: (trim_left, trim_top) in pixels at pdf_scale resolution
+    
     Returns:
         (pdf_x, pdf_y) in PyMuPDF coordinate space (top-left origin, Y down)
     """
     x, y = leaflet_coords
     scale = 2 ** metadata["max_zoom"]
     pdf_scale = metadata["quality_settings"]["pdf_scale"]
-
-    pdf_x = x * scale / pdf_scale
-    pdf_y = (-y) * scale / pdf_scale
-
+    trim_left, trim_top = trim_offset
+    
+    # Leaflet → trimmed image pixels → pre-trim image pixels → PDF points
+    pdf_x = (x * scale + trim_left) / pdf_scale
+    pdf_y = (-y * scale + trim_top) / pdf_scale
+    
     return (pdf_x, pdf_y)
 
 
 def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
-                       metadata: Dict[str, Any], config: Dict[str, Any]) -> None:
+                       metadata: Dict[str, Any], config: Dict[str, Any],
+                       trim_offset: Tuple[float, float] = (0.0, 0.0)) -> None:
     """
     Draw a filled polygon on the PDF page.
 
@@ -108,6 +189,7 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         coordinates: GeoJSON polygon coordinates [[[x, y], [x, y], ...]]
         metadata: Metadata for coordinate transformation
         config: Styling configuration
+        trim_offset: (trim_left, trim_top) whitespace offset in pixels
     """
     # GeoJSON polygons: coordinates[0] is outer ring
     outer_ring = coordinates[0]
@@ -119,7 +201,7 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
     for point in outer_ring:
         x, y = point[0], point[1]
         logging.info(f"  Leaflet: [{x}, {y}]")
-        x_pdf, y_pdf = transform_coords([x, y], metadata)
+        x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
         logging.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
         pdf_points.append(fitz.Point(x_pdf, y_pdf))
 
@@ -142,7 +224,8 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
 
 def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
                        metadata: Dict[str, Any], config: Dict[str, Any],
-                       label: str = None) -> None:
+                       label: str = None,
+                       trim_offset: Tuple[float, float] = (0.0, 0.0)) -> None:
     """
     Draw a circular marker on the PDF page.
 
@@ -152,14 +235,13 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
         metadata: Metadata for coordinate transformation
         config: Styling configuration
         label: Optional text label
+        trim_offset: (trim_left, trim_top) whitespace offset in pixels
     """
     x, y = coordinates[0], coordinates[1]
     logging.info(f"Drawing marker at [{x}, {y}]")
-
+    
     # Convert to PDF coordinates
-    x_pdf, y_pdf = transform_coords([x, y], metadata)
-    logging.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
-
+    x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
     # Draw circle
     shape = page.new_shape()
     radius = config["radius"]
@@ -181,7 +263,8 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
 
 
 def draw_square_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
-                      metadata: Dict[str, Any], config: Dict[str, Any]) -> None:
+                      metadata: Dict[str, Any], config: Dict[str, Any],
+                      trim_offset: Tuple[float, float] = (0.0, 0.0)) -> None:
     """
     Draw a filled square/rectangle on the PDF page.
 
@@ -190,9 +273,10 @@ def draw_square_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         coordinates: Rectangle coordinates (4 corner points)
         metadata: Metadata for coordinate transformation
         config: Styling configuration
+        trim_offset: (trim_left, trim_top) whitespace offset in pixels
     """
     # Treat squares the same as polygons
-    draw_polygon_on_pdf(page, coordinates, metadata, config)
+    draw_polygon_on_pdf(page, coordinates, metadata, config, trim_offset)
 
 
 def draw_text_on_pdf(page: fitz.Page, position: List[float],
@@ -278,6 +362,10 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"PDF size: {page.rect.width:.2f} x {page.rect.height:.2f} points")
     logging.info(f"Image size: {metadata['source_image']['width']} x {metadata['source_image']['height']} pixels")
     logging.info(f"Objects to draw: {len(objects)}")
+
+    # Detect whitespace trim offset (needed when PDF had margins that were cropped)
+    trim_offset = detect_trim_offset(page, metadata)
+    logging.info(f"Trim offset: left={trim_offset[0]:.1f}, top={trim_offset[1]:.1f} px")
     logging.info(f"=" * 80)
 
     # Process each object
@@ -294,13 +382,13 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
 
             if obj_type == "rectangle" or obj_type == "square" or geo_type == "Polygon":
                 config = ANNOTATION_CONFIG.get("square" if obj_type == "square" else "polygon")
-                draw_polygon_on_pdf(page, coordinates, metadata, config)
+                draw_polygon_on_pdf(page, coordinates, metadata, config, trim_offset)
                 objects_drawn += 1
 
             elif obj_type == "marker" or geo_type == "Point":
                 config = ANNOTATION_CONFIG["marker"]
                 label = obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
-                draw_marker_on_pdf(page, coordinates, metadata, config, label)
+                draw_marker_on_pdf(page, coordinates, metadata, config, label, trim_offset)
                 objects_drawn += 1
 
             else:
