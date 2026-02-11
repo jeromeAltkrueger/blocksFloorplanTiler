@@ -466,10 +466,10 @@ def blocks_floorplan_tiler_service(req: func.HttpRequest) -> func.HttpResponse:
             # Check if it's an Azure Blob Storage URL
             if 'blob.core.windows.net' in file_url:
                 # Use Azure SDK to download from blob storage
-                connection_string = os.environ.get("blocksplayground_STORAGE")
+                connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
                 if not connection_string:
                     return func.HttpResponse(
-                        json.dumps({"success": False, "error": "Storage connection string not configured"}),
+                        json.dumps({"success": False, "error": "Azure Storage connection string not configured"}),
                         status_code=500,
                         mimetype="application/json"
                     )
@@ -672,11 +672,11 @@ def blocks_floorplan_tiler_service(req: func.HttpRequest) -> func.HttpResponse:
         logging.info(f"Created Web Mercator metadata for ultra-high quality floor plan: {floorplan_id}")
 
         # 6. Upload to blob storage
-        connection_string = os.environ.get("blocksplayground_STORAGE")
+        connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
         if not connection_string:
-            logging.error("Storage connection string not found in environment")
+            logging.error("Azure Storage connection string not found in environment")
             return func.HttpResponse(
-                json.dumps({"error": "Storage connection string not configured"}),
+                json.dumps({"error": "Azure Storage connection string not configured"}),
                 status_code=500,
                 mimetype="application/json"
             )

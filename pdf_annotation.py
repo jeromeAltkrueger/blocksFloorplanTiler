@@ -1,6 +1,6 @@
 """
 PDF Annotation Module
-Handles annotating PDFs with shapes and markers from Leaflet drawings.
+Handles annotating PDFs with shapes and markers.
 """
 
 import azure.functions as func
@@ -19,79 +19,83 @@ import httpx
 # PDF ANNOTATION CONFIGURATION
 # ==========================================
 
-# Annotation styling - easily adjustable
+# Annotation styling
 ANNOTATION_CONFIG = {
     "polygon": {
         "fill_color": (1, 0, 0),      # Red (RGB normalized 0-1)
-        "fill_opacity": 0.3,           # 30% opacity for fill
-        "stroke_color": (1, 0, 0),     # Red border
-        "stroke_width": 2,             # Border width in points
-        "stroke_opacity": 0.8          # 80% opacity for border
+        "fill_opacity": 0.4,
+        "stroke_color": (1, 0, 0),
+        "stroke_width": 8,
+        "stroke_opacity": 1.0
     },
     "marker": {
-        "fill_color": (1, 0, 0),       # Red
-        "fill_opacity": 0.7,           # 70% opacity
-        "radius": 8,                   # Circle radius in points
-        "stroke_color": (0.5, 0, 0),   # Dark red border
-        "stroke_width": 1.5
+        "fill_color": (1, 0, 0),
+        "fill_opacity": 0.8,
+        "radius": 20,
+        "stroke_color": (0, 0, 0),
+        "stroke_width": 3
     },
     "square": {
-        "fill_color": (1, 0, 0),       # Red
-        "fill_opacity": 0.3,
+        "fill_color": (1, 0, 0),
+        "fill_opacity": 0.4,
         "stroke_color": (1, 0, 0),
-        "stroke_width": 2,
-        "stroke_opacity": 0.8
+        "stroke_width": 8,
+        "stroke_opacity": 1.0
     },
     "text": {
-        "font_size": 10,               # Font size in points
-        "font_color": (1, 0, 0),       # Red text
-        "background_color": (1, 1, 1), # White background
-        "background_opacity": 0.8,     # 80% opaque background
-        "padding": 2                   # Padding around text
+        "font_size": 14,
+        "font_color": (1, 0, 0),
+        "background_color": (1, 1, 1),
+        "background_opacity": 0.9,
+        "padding": 4
     }
 }
 
 
 # ==========================================
-# PDF ANNOTATION HELPER FUNCTIONS
+# COORDINATE TRANSFORMATION
+# ==========================================
+#
+# Pipeline: PDF → Image → Leaflet (forward)
+#   1. PDF → Image:  pixel = pdf_pt × pdf_scale        (fitz.Matrix)
+#   2. Image → Leaflet:  lng = pixel_x / 2^maxZoom
+#                         lat = -pixel_y / 2^maxZoom    (CRS.Simple)
+#
+# Pipeline: Leaflet → PDF (reverse, what we need)
+#   1. Leaflet → Image:  pixel_x = lng × 2^maxZoom
+#                         pixel_y = -lat × 2^maxZoom
+#   2. Image → PDF:  pdf_pt = pixel / pdf_scale
+#
+# Combined:
+#   pdf_x = leaflet_x × 2^maxZoom / pdf_scale
+#   pdf_y = (-leaflet_y) × 2^maxZoom / pdf_scale
+#
+# Notes:
+#   - scale = 2^maxZoom (from Leaflet CRS.Simple), NOT tileSize
+#   - pdf_scale = metadata.quality_settings.pdf_scale
+#   - No Y-flip: both PyMuPDF and image pixels use top-left origin
+#   - Leaflet Y is negative (lat = -pixel_y / scale), negating restores it
 # ==========================================
 
-def leaflet_to_pdf_coords(leaflet_coords: List[float], metadata: Dict[str, Any]) -> Tuple[float, float]:
+def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any]) -> Tuple[float, float]:
     """
-    Convert Leaflet Simple CRS coordinates to PDF pixel coordinates.
-
+    Transform Leaflet CRS.Simple coordinates to PyMuPDF PDF coordinates.
+    
     Args:
-        leaflet_coords: [lat, lon] from Leaflet (Simple CRS format)
-        metadata: Metadata containing bounds and image dimensions
-
+        leaflet_coords: [x, y] where x=lng (positive), y=lat (negative)
+        metadata: Must contain 'max_zoom' and 'quality_settings.pdf_scale'
+    
     Returns:
-        (x, y) tuple in PDF pixel coordinates
+        (pdf_x, pdf_y) in PyMuPDF coordinate space (top-left origin, Y down)
     """
-    lat, lon = leaflet_coords
-
-    # Extract bounds and dimensions from metadata
-    bounds = metadata["bounds"]  # [[lat_min, lon_min], [lat_max, lon_max]]
-    width = metadata["source_image"]["width"]
-    height = metadata["source_image"]["height"]
-
-    # Bounds format: [[south_west], [north_east]]
-    lat_min, lon_min = bounds[0]
-    lat_max, lon_max = bounds[1]
-
-    # Map latitude (y-axis) - note: PDF y=0 is at top, may need inversion
-    # In Simple CRS with bounds [[0,0], [height, width]], lat maps to y
-    if lat_max != lat_min:
-        y = ((lat - lat_min) / (lat_max - lat_min)) * height
-    else:
-        y = 0
-
-    # Map longitude (x-axis)
-    if lon_max != lon_min:
-        x = ((lon - lon_min) / (lon_max - lon_min)) * width
-    else:
-        x = 0
-
-    return (x, y)
+    x, y = leaflet_coords
+    scale = 2 ** metadata["max_zoom"]
+    pdf_scale = metadata["quality_settings"]["pdf_scale"]
+    
+    pdf_x = x * scale / pdf_scale
+    pdf_y = (-y) * scale / pdf_scale
+    
+    return (pdf_x, pdf_y)
 
 
 def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
@@ -101,28 +105,27 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
 
     Args:
         page: PyMuPDF page object
-        coordinates: GeoJSON polygon coordinates [[[lon, lat], [lon, lat], ...]]
+        coordinates: GeoJSON polygon coordinates [[[x, y], [x, y], ...]]
         metadata: Metadata for coordinate transformation
         config: Styling configuration
     """
     # GeoJSON polygons: coordinates[0] is outer ring
     outer_ring = coordinates[0]
 
-    # Convert Leaflet coords to PDF coords
-    # Note: GeoJSON uses [lon, lat] but Leaflet Simple CRS uses [lat, lon]
-    # Based on user's example, we'll treat them as [lat, lon]
+    logging.info(f"Drawing polygon with {len(outer_ring)} points")
+
+    # Convert coords to PDF coordinates
     pdf_points = []
     for point in outer_ring:
-        lat, lon = point[0], point[1] if len(point) > 1 else point[0]
-        x, y = leaflet_to_pdf_coords([lat, lon], metadata)
-        pdf_points.append(fitz.Point(x, y))
+        x, y = point[0], point[1]
+        logging.info(f"  Leaflet: [{x}, {y}]")
+        x_pdf, y_pdf = transform_coords([x, y], metadata)
+        logging.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
+        pdf_points.append(fitz.Point(x_pdf, y_pdf))
 
     # Draw filled polygon
     if len(pdf_points) >= 3:
-        # Create the shape
         shape = page.new_shape()
-
-        # Draw polygon with fill
         shape.draw_polyline(pdf_points)
         shape.finish(
             fill=config["fill_color"],
@@ -131,9 +134,10 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
             fill_opacity=config["fill_opacity"],
             stroke_opacity=config.get("stroke_opacity", 1.0)
         )
-
-        # Commit the shape to the page
         shape.commit()
+        logging.info(f"✅ Polygon drawn!")
+    else:
+        logging.warning(f"⚠️  Not enough points: {len(pdf_points)}")
 
 
 def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
@@ -144,20 +148,22 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
 
     Args:
         page: PyMuPDF page object
-        coordinates: [lat, lon] point coordinates
+        coordinates: [x, y] point coordinates
         metadata: Metadata for coordinate transformation
         config: Styling configuration
-        label: Optional text label to draw
+        label: Optional text label
     """
+    x, y = coordinates[0], coordinates[1]
+    logging.info(f"Drawing marker at [{x}, {y}]")
+    
     # Convert to PDF coordinates
-    x, y = leaflet_to_pdf_coords(coordinates, metadata)
+    x_pdf, y_pdf = transform_coords([x, y], metadata)
+    logging.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
 
     # Draw circle
     shape = page.new_shape()
     radius = config["radius"]
-
-    # Draw filled circle
-    shape.draw_circle(fitz.Point(x, y), radius)
+    shape.draw_circle(fitz.Point(x_pdf, y_pdf), radius)
     shape.finish(
         fill=config["fill_color"],
         color=config.get("stroke_color", config["fill_color"]),
@@ -165,11 +171,13 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
         fill_opacity=config["fill_opacity"]
     )
     shape.commit()
+    
+    logging.info(f"✅ Marker drawn!")
 
     # Draw label if provided
     if label:
         text_config = ANNOTATION_CONFIG["text"]
-        draw_text_on_pdf(page, [x, y + radius + 5], label, text_config)
+        draw_text_on_pdf(page, [x_pdf, y_pdf + radius + 5], label, text_config)
 
 
 def draw_square_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
@@ -260,42 +268,51 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     Returns:
         Annotated PDF as bytes
     """
-    # Open PDF with PyMuPDF
+    # Open PDF
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]  # First page
 
-    # Get first page (assuming single-page floorplan)
-    page = doc[0]
-
-    logging.info(f"PDF page size: {page.rect.width} x {page.rect.height}")
-    logging.info(f"Source image size: {metadata['source_image']['width']} x {metadata['source_image']['height']}")
+    logging.info(f"=" * 80)
+    logging.info(f"PDF ANNOTATION")
+    logging.info(f"=" * 80)
+    logging.info(f"PDF size: {page.rect.width:.2f} x {page.rect.height:.2f} points")
+    logging.info(f"Image size: {metadata['source_image']['width']} x {metadata['source_image']['height']} pixels")
+    logging.info(f"Objects to draw: {len(objects)}")
+    logging.info(f"=" * 80)
 
     # Process each object
-    for obj in objects:
+    objects_drawn = 0
+    for i, obj in enumerate(objects):
         try:
+            logging.info(f"\n--- Object {i + 1}/{len(objects)} ---")
             obj_type = obj.get("properties", {}).get("type", "unknown")
             geometry = obj.get("geometry", {})
             geo_type = geometry.get("type")
             coordinates = geometry.get("coordinates", [])
 
-            logging.info(f"Drawing {obj_type} ({geo_type})")
+            logging.info(f"Type: {obj_type}, Geometry: {geo_type}")
 
             if obj_type == "rectangle" or obj_type == "square" or geo_type == "Polygon":
-                # Draw polygon/rectangle
                 config = ANNOTATION_CONFIG.get("square" if obj_type == "square" else "polygon")
                 draw_polygon_on_pdf(page, coordinates, metadata, config)
+                objects_drawn += 1
 
             elif obj_type == "marker" or geo_type == "Point":
-                # Draw marker
                 config = ANNOTATION_CONFIG["marker"]
                 label = obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
                 draw_marker_on_pdf(page, coordinates, metadata, config, label)
+                objects_drawn += 1
 
             else:
-                logging.warning(f"Unknown object type: {obj_type} (geometry: {geo_type})")
+                logging.warning(f"⚠️  Unknown type: {obj_type}")
 
         except Exception as e:
-            logging.error(f"Error drawing object: {str(e)}", exc_info=True)
+            logging.error(f"❌ Error drawing object {i + 1}: {str(e)}", exc_info=True)
             continue
+
+    logging.info(f"\n{'=' * 80}")
+    logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn")
+    logging.info(f"{'=' * 80}\n")
 
     # Save to bytes
     output = io.BytesIO()
@@ -406,7 +423,7 @@ def register_routes(app: func.FunctionApp):
             annotated_filename = f"{original_filename}-annotation-{timestamp}.pdf"
 
             # Upload to Azure Blob Storage
-            connection_string = os.environ.get("blocksplayground_STORAGE")
+            connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
             if not connection_string:
                 return func.HttpResponse(
                     json.dumps({"success": False, "error": "Azure Storage connection string not configured"}),
