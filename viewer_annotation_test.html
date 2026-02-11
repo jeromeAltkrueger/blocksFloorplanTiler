@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html>
+
 <head>
     <title>Floorplan Annotation Test</title>
     <meta charset="utf-8" />
@@ -12,12 +13,14 @@
             padding: 0;
             font-family: Arial, sans-serif;
         }
+
         #map {
             position: absolute;
             top: 0;
             bottom: 200px;
             width: 100%;
         }
+
         #output {
             position: absolute;
             bottom: 0;
@@ -32,6 +35,7 @@
             padding: 10px;
             border-top: 2px solid #007acc;
         }
+
         #controls {
             position: absolute;
             top: 10px;
@@ -39,19 +43,22 @@
             background: white;
             padding: 15px;
             border-radius: 4px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
             z-index: 1000;
             max-width: 300px;
         }
+
         #controls h3 {
             margin: 0 0 10px 0;
         }
+
         #controls button {
             margin: 5px 0;
             padding: 8px 12px;
             width: 100%;
             cursor: pointer;
         }
+
         #controls input {
             width: 100%;
             padding: 5px;
@@ -59,15 +66,19 @@
             font-family: monospace;
             font-size: 11px;
         }
+
         .info {
             color: #4CAF50;
         }
+
         .warning {
             color: #ff9800;
         }
+
         .error {
             color: #f44336;
         }
+
         .code {
             background: #2d2d2d;
             padding: 10px;
@@ -77,105 +88,107 @@
         }
     </style>
 </head>
+
 <body>
     <div id="controls">
         <h3>📝 Annotation Test</h3>
         <div>
             <label>Metadata URL:</label>
-            <input type="text" id="metadataUrl" value="https://blocksplayground.blob.core.windows.net/blocks/floorplans/120021/metadata.json">
+            <input type="text" id="metadataUrl"
+                value="https://blocksplayground.blob.core.windows.net/blocks/floorplans/120021/metadata.json">
         </div>
         <button onclick="loadFloorplan()">Load Floorplan</button>
         <div id="status" style="margin-top: 10px; font-size: 11px;"></div>
     </div>
-    
+
     <div id="map"></div>
     <div id="output">
         <div class="info">👈 Load a floorplan, then use the drawing tools to draw rectangles.</div>
         <div class="info">📋 The GeoJSON will appear here automatically.</div>
     </div>
-    
+
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
     <script>
         let map, tileLayer, drawnItems, metadata;
-        
+
         function log(message, type = 'info') {
             const output = document.getElementById('output');
             const color = type === 'error' ? '#f44336' : type === 'warning' ? '#ff9800' : '#4CAF50';
             output.innerHTML += `<div style="color: ${color}">${message}</div>`;
             output.scrollTop = output.scrollHeight;
         }
-        
+
         function logCode(code) {
             const output = document.getElementById('output');
             output.innerHTML += `<div class="code">${code}</div>`;
             output.scrollTop = output.scrollHeight;
         }
-        
+
         async function loadFloorplan() {
             const metadataUrl = document.getElementById('metadataUrl').value;
             const status = document.getElementById('status');
-            
+
             try {
                 status.innerHTML = '<span class="info">Loading...</span>';
                 log('🔄 Loading metadata...', 'info');
-                
+
                 const response = await fetch(metadataUrl);
                 if (!response.ok) throw new Error('Failed to load metadata');
-                
+
                 metadata = await response.json();
                 log('✅ Metadata loaded', 'info');
                 log(`   Floorplan ID: ${metadata.floorplan_id}`, 'info');
                 log(`   Image size: ${metadata.source_image.width} x ${metadata.source_image.height}`, 'info');
-                
+
                 // CALCULATE CORRECT LEAFLET BOUNDS
                 const tileSize = metadata.tile_size || 512;
                 const maxZoom = metadata.max_zoom;
                 const scaleFactor = tileSize * Math.pow(2, maxZoom - maxZoom); // = tileSize
-                
+
                 const leafletWidth = metadata.source_image.width / scaleFactor;
                 const leafletHeight = metadata.source_image.height / scaleFactor;
-                
+
                 // Store calculated bounds
                 metadata.calculated_bounds = [[0, 0], [leafletHeight, leafletWidth]];
-                
+
                 log(`   Calculated Leaflet bounds: [[0, 0], [${leafletHeight.toFixed(2)}, ${leafletWidth.toFixed(2)}]]`, 'info');
                 log('   ', 'info');
                 log('   ⚠️  Note: Metadata bounds may be incorrect (in pixels): ' + JSON.stringify(metadata.bounds), 'warning');
                 log('   ✅  Using calculated bounds instead (in Leaflet coordinate space)', 'info');
-                
+
                 // Initialize map if not already done
                 if (!map) {
                     initMap(metadata);
                 } else {
                     updateMap(metadata);
                 }
-                
+
                 status.innerHTML = '<span class="info">✅ Ready</span>';
-                
+
             } catch (error) {
                 log(`❌ Error: ${error.message}`, 'error');
                 status.innerHTML = `<span class="error">Error: ${error.message}</span>`;
             }
         }
-        
+
         function initMap(metadata) {
             const width = metadata.source_image.width;
             const height = metadata.source_image.height;
             const minZoom = metadata.min_zoom;
             const maxZoom = metadata.max_zoom;
             const tileSize = metadata.tile_size || 512;
-            
+
             // Use calculated bounds (NOT metadata.bounds which may be wrong)
             const bounds = metadata.calculated_bounds;
             const center = [bounds[1][0] / 2, bounds[1][1] / 2]; // [height/2, width/2] in Leaflet space
-            
+
             log('🗺️  Initializing map with L.CRS.Simple', 'info');
             log(`   Bounds: ${JSON.stringify(bounds)}`, 'info');
             log(`   Center: [${center[0].toFixed(2)}, ${center[1].toFixed(2)}]`, 'info');
             log(`   Bounds: ${JSON.stringify(bounds)}`, 'info');
             log(`   Center: [${center[0].toFixed(2)}, ${center[1].toFixed(2)}]`, 'info');
-            
+
             // Initialize map with Simple CRS
             map = L.map('map', {
                 crs: L.CRS.Simple,
@@ -184,15 +197,15 @@
                 maxBounds: bounds,
                 maxBoundsViscosity: 1.0
             });
-            
+
             map.setView(center, maxZoom);
-            
+
             // Construct tile URL
             const baseUrl = metadata.tile_url_template || `https://blocksplayground.blob.core.windows.net/blocks/floorplans/${metadata.floorplan_id}`;
             const tileUrl = baseUrl.includes('{z}') ? baseUrl : `${baseUrl}/{z}/{x}/{y}.png`;
-            
+
             log(`   Tile URL: ${tileUrl}`, 'info');
-            
+
             // Add tile layer
             tileLayer = L.tileLayer(tileUrl, {
                 tileSize: tileSize,
@@ -201,11 +214,11 @@
                 bounds: bounds,
                 noWrap: true
             }).addTo(map);
-            
+
             // Initialize drawing tools
             drawnItems = new L.FeatureGroup();
             map.addLayer(drawnItems);
-            
+
             const drawControl = new L.Control.Draw({
                 draw: {
                     polygon: true,
@@ -221,7 +234,7 @@
                 }
             });
             map.addControl(drawControl);
-            
+
             log('✅ Drawing tools enabled', 'info');
             log('', 'info');
             log('📝 Instructions:', 'info');
@@ -229,22 +242,22 @@
             log('   2. The GeoJSON coordinates will appear below automatically', 'info');
             log('   3. Copy the entire object array to test with the annotation API', 'info');
             log('', 'info');
-            
+
             // Handle drawing events
             map.on(L.Draw.Event.CREATED, function (event) {
                 const layer = event.layer;
                 drawnItems.addLayer(layer);
-                
+
                 // Get GeoJSON
                 const geoJson = layer.toGeoJSON();
-                
+
                 log('━'.repeat(60), 'info');
                 log('✏️  New shape drawn!', 'info');
                 log('', 'info');
                 log('📋 Copy this object for the annotation API:', 'info');
                 logCode(JSON.stringify(geoJson, null, 2));
                 log('', 'info');
-                
+
                 // Show coordinate details
                 const coords = geoJson.geometry.coordinates;
                 if (geoJson.geometry.type === 'Polygon') {
@@ -255,34 +268,34 @@
                 } else if (geoJson.geometry.type === 'Point') {
                     log(`📍 Point: [${coords[0].toFixed(2)}, ${coords[1].toFixed(2)}]`, 'info');
                 }
-                
+
                 log('', 'info');
                 log('✅ These coordinates are in the correct format!', 'info');
                 log(`   X (longitude) range: 0 to ${bounds[1][1].toFixed(2)}`, 'info');
                 log(`   Y (latitude) range: 0 to ${bounds[1][0].toFixed(2)}`, 'info');
                 log('━'.repeat(60), 'info');
             });
-            
+
             map.on(L.Draw.Event.DELETED, function (event) {
                 log('🗑️  Shape(s) deleted', 'warning');
             });
         }
-        
+
         function updateMap(metadata) {
             const bounds = metadata.calculated_bounds;
             const center = [bounds[1][0] / 2, bounds[1][1] / 2];
-            
+
             map.setMaxBounds(bounds);
             map.setView(center, map.getZoom());
-            
+
             // Update tile layer
             const baseUrl = `https://blocksplayground.blob.core.windows.net/blocks/floorplans/${metadata.floorplan_id}`;
             const tileUrl = `${baseUrl}/{z}/{x}/{y}.png`;
-            
+
             if (tileLayer) {
                 map.removeLayer(tileLayer);
             }
-            
+
             tileLayer = L.tileLayer(tileUrl, {
                 tileSize: metadata.tile_size || 512,
                 minNativeZoom: metadata.min_zoom,
@@ -290,16 +303,17 @@
                 bounds: bounds,
                 noWrap: true
             }).addTo(map);
-            
+
             log('✅ Map updated with new floorplan', 'info');
         }
-        
+
         // Auto-load on page load
-        window.onload = function() {
+        window.onload = function () {
             log('🚀 Ready to load floorplan!', 'info');
             log('   Enter a metadata URL and click "Load Floorplan"', 'info');
             log('', 'info');
         };
     </script>
 </body>
+
 </html>

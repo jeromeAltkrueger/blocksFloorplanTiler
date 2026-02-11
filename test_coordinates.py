@@ -24,13 +24,13 @@ def calculate_correct_leaflet_bounds(metadata):
     height = metadata["source_image"]["height"]
     max_zoom = metadata["max_zoom"]
     tile_size = metadata["tile_size"]
-    
+
     # At max zoom: leafletCoord = pixelCoord / tileSize
     scale_factor = tile_size * (2 ** (max_zoom - max_zoom))  # = tileSize
-    
+
     leaflet_width = width / scale_factor
     leaflet_height = height / scale_factor
-    
+
     return {
         "lon_min": 0,
         "lat_min": 0,
@@ -43,20 +43,20 @@ def leaflet_to_pdf_coords(leaflet_coords, leaflet_bounds, pdf_size):
     """Transform from Leaflet space to PDF pixel space"""
     x_leaflet, y_leaflet = leaflet_coords
     pdf_width, pdf_height = pdf_size
-    
+
     lon_min = leaflet_bounds["lon_min"]
     lat_min = leaflet_bounds["lat_min"]
     lon_max = leaflet_bounds["lon_max"]
     lat_max = leaflet_bounds["lat_max"]
-    
+
     # First, convert to normalized coordinates (0-1 range)
     x_norm = (x_leaflet - lon_min) / (lon_max - lon_min) if lon_max != lon_min else 0
     y_norm = (y_leaflet - lat_min) / (lat_max - lat_min) if lat_max != lat_min else 0
-    
+
     # Then scale to PDF dimensions
     x_pdf = x_norm * pdf_width
     y_pdf = y_norm * pdf_height
-    
+
     return x_pdf, y_pdf
 
 print("=" * 80)
@@ -218,4 +218,3 @@ print("🔧 Follow the solution above to fix your Leaflet map")
 print("📝 Use the test viewer (viewer_annotation_test.html) to get correct coords")
 print()
 print("=" * 80)
-

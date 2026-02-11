@@ -80,21 +80,21 @@ ANNOTATION_CONFIG = {
 def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any]) -> Tuple[float, float]:
     """
     Transform Leaflet CRS.Simple coordinates to PyMuPDF PDF coordinates.
-    
+
     Args:
         leaflet_coords: [x, y] where x=lng (positive), y=lat (negative)
         metadata: Must contain 'max_zoom' and 'quality_settings.pdf_scale'
-    
+
     Returns:
         (pdf_x, pdf_y) in PyMuPDF coordinate space (top-left origin, Y down)
     """
     x, y = leaflet_coords
     scale = 2 ** metadata["max_zoom"]
     pdf_scale = metadata["quality_settings"]["pdf_scale"]
-    
+
     pdf_x = x * scale / pdf_scale
     pdf_y = (-y) * scale / pdf_scale
-    
+
     return (pdf_x, pdf_y)
 
 
@@ -155,7 +155,7 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     """
     x, y = coordinates[0], coordinates[1]
     logging.info(f"Drawing marker at [{x}, {y}]")
-    
+
     # Convert to PDF coordinates
     x_pdf, y_pdf = transform_coords([x, y], metadata)
     logging.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
@@ -171,7 +171,7 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
         fill_opacity=config["fill_opacity"]
     )
     shape.commit()
-    
+
     logging.info(f"✅ Marker drawn!")
 
     # Draw label if provided
