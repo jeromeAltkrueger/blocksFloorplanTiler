@@ -3,18 +3,18 @@ PDF Annotation Module
 Handles annotating PDFs with shapes and markers.
 """
 
-import azure.functions as func
-import logging
-import fitz  # PyMuPDF for PDF annotation
-from typing import List, Dict, Any, Tuple
 import io
 import json
-from datetime import datetime
-from azure.storage.blob import BlobServiceClient, ContentSettings
+import logging
 import os
-import httpx
-from PIL import Image, ImageChops
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
 
+import azure.functions as func
+import fitz  # PyMuPDF for PDF annotation
+import httpx
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from PIL import Image, ImageChops
 
 # ==========================================
 # PDF ANNOTATION CONFIGURATION
@@ -220,7 +220,7 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         )
         shape.commit()
         logging.info(f"✅ Polygon drawn!")
-        
+
         # Draw overlay text at the polygon centroid if provided
         if overlay:
             # Calculate centroid of the polygon
@@ -228,13 +228,13 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
             sum_y = sum(p.y for p in pdf_points)
             centroid_x = sum_x / len(pdf_points)
             centroid_y = sum_y / len(pdf_points)
-            
+
             # Draw the overlay text centered at the centroid
             font_size = 10
             padding = 2
             text_width = fitz.get_text_length(overlay, fontsize=font_size)
             text_height = font_size
-            
+
             # Draw white background
             bg_rect = fitz.Rect(
                 centroid_x - text_width / 2 - padding,
@@ -249,11 +249,11 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                 fill_opacity=1.0  # Solid
             )
             bg_shape.commit()
-            
+
             # Draw text on top
             text_x = centroid_x - text_width / 2
             text_y = centroid_y + font_size / 3
-            
+
             page.insert_text(
                 fitz.Point(text_x, text_y),
                 overlay,
@@ -312,11 +312,11 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     if overlay:
         font_size = min(radius * 0.5, 8)  # Keep text readable
         padding = 1
-        
+
         # Calculate text dimensions
         text_width = fitz.get_text_length(overlay, fontsize=font_size)
         text_height = font_size
-        
+
         # Draw white background
         bg_rect = fitz.Rect(
             x_pdf - text_width / 2 - padding,
@@ -331,7 +331,7 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
             fill_opacity=1.0  # Solid
         )
         bg_shape.commit()
-        
+
         # Draw text on top
         text_x = x_pdf - text_width / 2
         text_y = y_pdf + font_size / 3  # Baseline offset for visual centering
