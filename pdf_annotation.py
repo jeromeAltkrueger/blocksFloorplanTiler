@@ -180,15 +180,17 @@ def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any],
 
 def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                        metadata: Dict[str, Any], config: Dict[str, Any],
+                       overlay: str = None,
                        trim_offset: Tuple[float, float] = (0.0, 0.0)) -> None:
     """
-    Draw a filled polygon on the PDF page.
+    Draw a filled polygon on the PDF page, optionally with centered overlay text.
 
     Args:
         page: PyMuPDF page object
         coordinates: GeoJSON polygon coordinates [[[x, y], [x, y], ...]]
         metadata: Metadata for coordinate transformation
         config: Styling configuration
+        overlay: Optional text to display at the polygon's centroid
         trim_offset: (trim_left, trim_top) whitespace offset in pixels
     """
     # GeoJSON polygons: coordinates[0] is outer ring
@@ -218,6 +220,47 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         )
         shape.commit()
         logging.info(f"✅ Polygon drawn!")
+        
+        # Draw overlay text at the polygon centroid if provided
+        if overlay:
+            # Calculate centroid of the polygon
+            sum_x = sum(p.x for p in pdf_points)
+            sum_y = sum(p.y for p in pdf_points)
+            centroid_x = sum_x / len(pdf_points)
+            centroid_y = sum_y / len(pdf_points)
+            
+            # Draw the overlay text centered at the centroid
+            font_size = 10
+            padding = 2
+            text_width = fitz.get_text_length(overlay, fontsize=font_size)
+            text_height = font_size
+            
+            # Draw white background
+            bg_rect = fitz.Rect(
+                centroid_x - text_width / 2 - padding,
+                centroid_y - text_height / 2 - padding,
+                centroid_x + text_width / 2 + padding,
+                centroid_y + text_height / 2 + padding
+            )
+            bg_shape = page.new_shape()
+            bg_shape.draw_rect(bg_rect)
+            bg_shape.finish(
+                fill=(1, 1, 1),  # White background
+                fill_opacity=1.0  # Solid
+            )
+            bg_shape.commit()
+            
+            # Draw text on top
+            text_x = centroid_x - text_width / 2
+            text_y = centroid_y + font_size / 3
+            
+            page.insert_text(
+                fitz.Point(text_x, text_y),
+                overlay,
+                fontsize=font_size,
+                color=(0, 0, 0)  # Black text
+            )
+            logging.info(f"✅ Polygon overlay text drawn: '{overlay}'")
     else:
         logging.warning(f"⚠️  Not enough points: {len(pdf_points)}")
 
@@ -248,7 +291,7 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
 
     # If overlay text is provided, scale the circle to fit the text
     if overlay:
-        font_size = min(radius * 0.5, 4)  # Keep text very small
+        font_size = min(radius * 0.5, 8)  # Keep text readable
         # Estimate text width and ensure circle is large enough
         text_width = len(overlay) * font_size * 0.5
         min_radius = max(radius, text_width / 2 + 4, font_size / 2 + 4)
@@ -267,15 +310,36 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
 
     # Draw centered overlay text inside the circle
     if overlay:
-        # Calculate text position to center it
+        font_size = min(radius * 0.5, 8)  # Keep text readable
+        padding = 1
+        
+        # Calculate text dimensions
         text_width = fitz.get_text_length(overlay, fontsize=font_size)
+        text_height = font_size
+        
+        # Draw white background
+        bg_rect = fitz.Rect(
+            x_pdf - text_width / 2 - padding,
+            y_pdf - text_height / 2 - padding,
+            x_pdf + text_width / 2 + padding,
+            y_pdf + text_height / 2 + padding
+        )
+        bg_shape = page.new_shape()
+        bg_shape.draw_rect(bg_rect)
+        bg_shape.finish(
+            fill=(1, 1, 1),  # White background
+            fill_opacity=1.0  # Solid
+        )
+        bg_shape.commit()
+        
+        # Draw text on top
         text_x = x_pdf - text_width / 2
         text_y = y_pdf + font_size / 3  # Baseline offset for visual centering
         page.insert_text(
             fitz.Point(text_x, text_y),
             overlay,
             fontsize=font_size,
-            color=(0, 0, 1)  # Blue text on red circle
+            color=(0, 0, 0)  # Black text
         )
         logging.info(f"✅ Marker drawn with overlay: '{overlay}'")
     else:
@@ -289,19 +353,21 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
 
 def draw_square_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                       metadata: Dict[str, Any], config: Dict[str, Any],
+                      overlay: str = None,
                       trim_offset: Tuple[float, float] = (0.0, 0.0)) -> None:
     """
-    Draw a filled square/rectangle on the PDF page.
+    Draw a filled square/rectangle on the PDF page, optionally with centered overlay text.
 
     Args:
         page: PyMuPDF page object
         coordinates: Rectangle coordinates (4 corner points)
         metadata: Metadata for coordinate transformation
         config: Styling configuration
+        overlay: Optional text to display at the polygon's centroid
         trim_offset: (trim_left, trim_top) whitespace offset in pixels
     """
     # Treat squares the same as polygons
-    draw_polygon_on_pdf(page, coordinates, metadata, config, trim_offset)
+    draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset)
 
 
 def draw_text_on_pdf(page: fitz.Page, position: List[float],
@@ -407,7 +473,8 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
 
             if obj_type == "rectangle" or obj_type == "square" or geo_type == "Polygon":
                 config = ANNOTATION_CONFIG.get("square" if obj_type == "square" else "polygon")
-                draw_polygon_on_pdf(page, coordinates, metadata, config, trim_offset)
+                overlay = obj.get("overlay")
+                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset)
                 objects_drawn += 1
 
             elif obj_type == "marker" or geo_type == "Point":
