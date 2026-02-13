@@ -472,13 +472,19 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             logging.info(f"Type: {obj_type}, Geometry: {geo_type}")
 
             if obj_type == "rectangle" or obj_type == "square" or geo_type == "Polygon":
-                config = ANNOTATION_CONFIG.get("square" if obj_type == "square" else "polygon")
+                config = ANNOTATION_CONFIG.get("square" if obj_type == "square" else "polygon").copy()
+                # Apply transparent property if present
+                if obj.get("properties", {}).get("transparent") is True:
+                    config["fill_opacity"] = 0
                 overlay = obj.get("overlay")
                 draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset)
                 objects_drawn += 1
 
             elif obj_type == "marker" or geo_type == "Point":
-                config = ANNOTATION_CONFIG["marker"]
+                config = ANNOTATION_CONFIG["marker"].copy()
+                # Apply transparent property if present
+                if obj.get("properties", {}).get("transparent") is True:
+                    config["fill_opacity"] = 0
                 label = obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
                 overlay = obj.get("overlay")
                 draw_marker_on_pdf(page, coordinates, metadata, config, label, overlay, trim_offset)
