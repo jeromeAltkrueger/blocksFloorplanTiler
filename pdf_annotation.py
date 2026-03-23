@@ -828,9 +828,29 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"=" * 80)
     logging.info(f"PDF ANNOTATION")
     logging.info(f"=" * 80)
-    logging.info(f"PDF size: {page.rect.width:.2f} x {page.rect.height:.2f} points")
-    logging.info(f"Image size: {metadata['source_image']['width']} x {metadata['source_image']['height']} pixels")
-    logging.info(f"Objects to draw: {len(objects)}")
+
+    # ── Floorplan specs ───────────────────────────────────────────────────────
+    pdf_w = page.rect.width
+    pdf_h = page.rect.height
+    img_w = metadata['source_image']['width']
+    img_h = metadata['source_image']['height']
+    pts_per_mm = 2.8346
+    px_per_pt_x = img_w / pdf_w
+    px_per_pt_y = img_h / pdf_h
+
+    logging.info(f"  PDF size   : {pdf_w:.1f} x {pdf_h:.1f} pt  ({pdf_w/pts_per_mm:.1f} x {pdf_h/pts_per_mm:.1f} mm)")
+    logging.info(f"  Image size : {img_w} x {img_h} px")
+    logging.info(f"  Px/pt ratio: {px_per_pt_x:.3f} x (horiz)  {px_per_pt_y:.3f} y (vert)")
+    logging.info(f"  1 pt = {1/px_per_pt_x:.2f} px (horiz)  |  1 px = {px_per_pt_x:.3f} pt")
+    logging.info(f"  Default callout: font=9pt ({9/pts_per_mm:.1f}mm)  box=130x? pt ({130/pts_per_mm:.1f}mm wide)")
+
+    # Count object types
+    type_counts: Dict[str, int] = {}
+    for obj in objects:
+        geo_type = obj.get("geometry", {}).get("type", "unknown")
+        type_counts[geo_type] = type_counts.get(geo_type, 0) + 1
+    logging.info(f"  Objects    : {len(objects)} total — " + ", ".join(f"{v}x {k}" for k, v in type_counts.items()))
+    logging.info(f"=" * 80)
 
     # Detect whitespace trim offset (needed when PDF had margins that were cropped)
     trim_offset = detect_trim_offset(page, metadata)
