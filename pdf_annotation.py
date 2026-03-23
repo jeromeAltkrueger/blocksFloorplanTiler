@@ -661,6 +661,15 @@ def place_callout_annotation(
     placed_boxes.append(best_rect)
     logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
 
+    # Return the leader-line endpoints so the caller can draw them as Line
+    # annotations AFTER all FreeText annotations are placed.  PDF rendering is
+    # always: content-stream first, then annotations in /Annots order.  Drawing
+    # lines here (inside the function) — whether as content-stream shapes or as
+    # annotations — would let later FreeText boxes paint over them.  Only by
+    # adding Line annotations AFTER every FreeText annotation are the lines
+    # guaranteed to render on top of all boxes in get_pixmap().
+    return (attach, tip)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DIAGNOSTIC RETIRED — findings summary:
@@ -903,13 +912,27 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         logging.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
         # Seed with shape bounding boxes so callouts won't overlap fills/circles.
         placed_boxes: List[fitz.Rect] = list(shape_rects)
+        leader_lines: List[Tuple[fitz.Point, fitz.Point]] = []
         for item in pending_callouts:
             cx, cy, r, callout_text = item[:4]
             poly_pts = item[4] if len(item) > 4 else None
             try:
-                place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, polygon_points=poly_pts, forbidden_rects=polygon_rects)
+                result = place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, polygon_points=poly_pts, forbidden_rects=polygon_rects)
+                if result:
+                    leader_lines.append(result)
             except Exception as e:
                 logging.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
+
+        # Draw leader lines as Line annotations AFTER all FreeText annotations.
+        # Annotations render in /Annots array order; adding these last ensures
+        # they paint on top of every black FreeText box, regardless of density.
+        line_width = max(0.75, min(3.0, page.rect.width * 0.0005))
+        for (a_pt, t_pt) in leader_lines:
+            la = page.add_line_annot(t_pt, a_pt)
+            la.set_colors(stroke=(1, 0.5, 0))
+            la.set_border(width=line_width)
+            la.update()
+        logging.info(f"  Drew {len(leader_lines)} leader line(s) on top of all callout boxes (width={line_width:.2f}pt)")
 
     logging.info(f"\n{'=' * 80}")
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
