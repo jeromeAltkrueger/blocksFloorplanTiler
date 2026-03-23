@@ -454,6 +454,14 @@ def place_callout_annotation(
     """
     page_rect = page.rect
 
+    # ── Sizing diagnostics (inputs) ───────────────────────────────────────────
+    logging.info(
+        f"   [sizing-in]  text='{text}' | chars={len(text)}"
+        f" | page={page_rect.width:.0f}x{page_rect.height:.0f}pt"
+        f" | radius={marker_radius:.1f}pt"
+        f" | font={font_size}pt | box_w={box_width}pt | gap={gap}pt"
+    )
+
     # ── Estimate box height from line-wrapped text ────────────────────────────
     chars_per_line = max(1, int(box_width / (font_size * 0.55)))
     words = text.split()
@@ -478,6 +486,15 @@ def place_callout_annotation(
 
     # Minimum distance from marker centre to the nearest box edge
     min_dist = marker_radius + gap
+
+    # ── Sizing diagnostics (derived) ──────────────────────────────────────────
+    logging.info(
+        f"   [sizing-out] chars_per_line={chars_per_line} | n_lines={n_lines}"
+        f" | box={box_width:.0f}x{box_height:.1f}pt"
+        f" | min_dist={min_dist:.1f}pt (radius {marker_radius:.1f} + gap {gap})"
+        f" | page_fraction: box_w={box_width/page_rect.width*100:.1f}%"
+        f"  radius={marker_radius/page_rect.width*100:.2f}%"
+    )
 
     # ── 8 candidate directions (PDF coords: +y = down) ────────────────────────
     # Ordered so the most readable directions (E, NE, N …) are tried first.
