@@ -50,7 +50,7 @@ PRODUCTION_STORAGE_ACCOUNT_NAME = os.environ.get("PRODUCTION_STORAGE_ACCOUNT_NAM
 def verify_api_key(x_api_key: str = Header(None)):
     """Verify the API key from request header"""
     if not API_KEY:
-        # If no API key is configured, allow all requests (backward compatibility)
+        # If no API key is configured, allow all requests (backward compatibility :))
         return True
 
     if x_api_key is None:
