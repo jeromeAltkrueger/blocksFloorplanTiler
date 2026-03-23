@@ -683,11 +683,24 @@ def place_callout_annotation(
 
     attach = fitz.Point(ax, ay)
 
-    # For polygons: snap the tip to the closest point on the perimeter so the
-    # arrow touches the polygon edge rather than pointing at the interior.
+    # For polygons: snap to the perimeter then nudge the tip a few points into
+    # the interior so the line visually pierces the fill edge rather than just
+    # grazing it.  The nudge vector points from the perimeter point toward the
+    # polygon centroid; clamped so it never overshoots the centroid.
     # For markers: use the marker centre as before.
     if polygon_points:
-        tip = _closest_point_on_polygon(attach, polygon_points)
+        perim_pt = _closest_point_on_polygon(attach, polygon_points)
+        NUDGE = 6.0  # pt — how far inside the polygon the tip lands
+        cx_poly = marker_x  # marker_x/y hold the centroid for polygons
+        cy_poly = marker_y
+        vx, vy = cx_poly - perim_pt.x, cy_poly - perim_pt.y
+        vlen = (vx * vx + vy * vy) ** 0.5
+        if vlen > 0:
+            nudge = min(NUDGE, vlen)  # don't overshoot centroid
+            tip = fitz.Point(perim_pt.x + vx / vlen * nudge,
+                             perim_pt.y + vy / vlen * nudge)
+        else:
+            tip = perim_pt
     else:
         tip = fitz.Point(marker_x, marker_y)
 
