@@ -411,6 +411,26 @@ def _closest_point_on_polygon(query: fitz.Point, pts: List[fitz.Point]) -> fitz.
     return best_pt
 
 
+def _segments_intersect(p1: fitz.Point, p2: fitz.Point,
+                       p3: fitz.Point, p4: fitz.Point) -> bool:
+    """
+    Return True if segment p1-p2 and segment p3-p4 properly cross each other.
+
+    Uses the cross-product orientation test.  Collinear / touching-endpoint
+    cases return False intentionally: leader lines fanning out from nearby
+    anchors often share a near-common origin and we don't want to penalise that.
+    """
+    def _cross(o: fitz.Point, a: fitz.Point, b: fitz.Point) -> float:
+        return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+
+    d1 = _cross(p3, p4, p1)
+    d2 = _cross(p3, p4, p2)
+    d3 = _cross(p1, p2, p3)
+    d4 = _cross(p1, p2, p4)
+    return (((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and
+            ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)))
+
+
 def place_callout_annotation(
         page: fitz.Page,
         marker_x: float,
@@ -422,7 +442,8 @@ def place_callout_annotation(
         box_width: float = 130.0,
         gap: float = 15.0,
         polygon_points: List[fitz.Point] = None,
-        forbidden_rects: List[fitz.Rect] = None) -> None:
+        forbidden_rects: List[fitz.Rect] = None,
+        committed_lines: List[Tuple[fitz.Point, fitz.Point]] = None) -> None:
     """
     Add a Callout FreeText annotation.
 
@@ -434,23 +455,27 @@ def place_callout_annotation(
     The text box is placed outside the shape with a minimum gap equal to
     marker_radius + gap points.  Eight candidate directions are tried in order;
     the position with the least overlap against already-placed callout boxes is
-    chosen (zero-overlap preferred).  The chosen rect is appended to
-    placed_boxes so subsequent calls avoid it.
+    chosen (zero-overlap preferred).  A crossing penalty is added for each
+    already-committed leader line the proposed line would cross.  The chosen
+    rect is appended to placed_boxes so subsequent calls avoid it.
 
     Args:
-        page:            PyMuPDF page object.
-        marker_x/y:      Anchor point in PDF points used for box placement
-                         (marker centre or polygon centroid).
-        marker_radius:   Exclusion radius around the anchor (circle radius for
-                         markers, circumradius for polygons).
-        text:            Text to display in the callout box.
-        placed_boxes:    Mutable list of already-placed Rect objects.
-        font_size:       Font size for the callout text.
-        box_width:       Fixed width for the text box in points.
-        gap:             Minimum clearance beyond marker_radius to box edge.
-        polygon_points:  If provided, the arrow tip is snapped to the closest
-                         point on this polygon's outer-ring perimeter instead
-                         of the anchor point.  Pass None for circular markers.
+        page:             PyMuPDF page object.
+        marker_x/y:       Anchor point in PDF points used for box placement
+                          (marker centre or polygon centroid).
+        marker_radius:    Exclusion radius around the anchor (circle radius for
+                          markers, circumradius for polygons).
+        text:             Text to display in the callout box.
+        placed_boxes:     Mutable list of already-placed Rect objects.
+        font_size:        Font size for the callout text.
+        box_width:        Fixed width for the text box in points.
+        gap:              Minimum clearance beyond marker_radius to box edge.
+        polygon_points:   If provided, the arrow tip is snapped to the closest
+                          point on this polygon's outer-ring perimeter instead
+                          of the anchor point.  Pass None for circular markers.
+        committed_lines:  Already-drawn leader lines as (attach, tip) pairs.
+                          Each crossing adds a large penalty so the optimiser
+                          strongly prefers non-crossing placements.
     """
     page_rect = page.rect
 
@@ -562,6 +587,24 @@ def place_callout_annotation(
                 if not inter.is_empty:
                     overlap += inter.width * inter.height
 
+            # Crossing penalty: compute the proposed leader line for this
+            # candidate and count how many committed lines it would cross.
+            # One crossing costs more than a full box overlap so the optimiser
+            # strongly prefers non-crossing placements without breaking ties
+            # in impossible layouts.
+            if committed_lines:
+                # Attach point for this candidate (same logic as the final block)
+                ccx0, ccy0, ccx1, ccy1 = candidate.x0, candidate.y0, candidate.x1, candidate.y1
+                cax = ccx0 if marker_x <= ccx0 else (ccx1 if marker_x >= ccx1 else (ccx0 + ccx1) / 2)
+                cay = ccy0 if marker_y <= ccy0 else (ccy1 if marker_y >= ccy1 else (ccy0 + ccy1) / 2)
+                c_attach = fitz.Point(cax, cay)
+                c_tip = (_closest_point_on_polygon(c_attach, polygon_points)
+                         if polygon_points else fitz.Point(marker_x, marker_y))
+                crossing_penalty = page_rect.width * page_rect.height * 0.001
+                for (cl_a, cl_t) in committed_lines:
+                    if _segments_intersect(c_attach, c_tip, cl_a, cl_t):
+                        overlap += crossing_penalty
+
             if overlap < best_score:
                 best_score = overlap
                 best_rect = candidate
@@ -596,6 +639,17 @@ def place_callout_annotation(
                     inter = candidate & padded
                     if not inter.is_empty:
                         overlap += inter.width * inter.height
+                if committed_lines:
+                    ccx0, ccy0, ccx1, ccy1 = candidate.x0, candidate.y0, candidate.x1, candidate.y1
+                    cax = ccx0 if marker_x <= ccx0 else (ccx1 if marker_x >= ccx1 else (ccx0 + ccx1) / 2)
+                    cay = ccy0 if marker_y <= ccy0 else (ccy1 if marker_y >= ccy1 else (ccy0 + ccy1) / 2)
+                    c_attach = fitz.Point(cax, cay)
+                    c_tip = (_closest_point_on_polygon(c_attach, polygon_points)
+                             if polygon_points else fitz.Point(marker_x, marker_y))
+                    crossing_penalty = page_rect.width * page_rect.height * 0.001
+                    for (cl_a, cl_t) in committed_lines:
+                        if _segments_intersect(c_attach, c_tip, cl_a, cl_t):
+                            overlap += crossing_penalty
                 if overlap < best_score:
                     best_score = overlap
                     best_rect = candidate
@@ -917,7 +971,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             cx, cy, r, callout_text = item[:4]
             poly_pts = item[4] if len(item) > 4 else None
             try:
-                result = place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, polygon_points=poly_pts, forbidden_rects=polygon_rects)
+                result = place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, polygon_points=poly_pts, forbidden_rects=polygon_rects, committed_lines=leader_lines)
                 if result:
                     leader_lines.append(result)
             except Exception as e:
