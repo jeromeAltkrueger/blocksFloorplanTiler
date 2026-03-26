@@ -488,7 +488,8 @@ def place_callout_annotation(
     )
 
     # ── Estimate box height from line-wrapped text ────────────────────────────
-    chars_per_line = max(1, int(box_width / (font_size * 0.55)))
+    # Use 0.65 char-width ratio (vs 0.55 for regular) to account for bold glyphs being wider
+    chars_per_line = max(1, int(box_width / (font_size * 0.65)))
     words = text.split()
     lines: List[str] = []
     current = ""
@@ -717,9 +718,9 @@ def place_callout_annotation(
         best_rect,
         text,
         fontsize=font_size,
-        fontname="helv",
-        fill_color=(0, 0, 0),        # black box background
-        text_color=(1, 0.5, 0),      # orange → controls text, box border AND leader line
+        fontname="hebo",
+        fill_color=(1, 0.85, 0),     # amber-yellow box background (richer than pure yellow on print)
+        text_color=(0.75, 0, 0),     # dark crimson red → controls text, box border AND leader line (~6:1 contrast on amber)
         border_width=2.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_NONE,
@@ -920,6 +921,14 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"  1 pt = {1/px_per_pt_x:.2f} px (horiz)  |  1 px = {px_per_pt_x:.3f} pt")
     logging.info(f"  Default callout: font=9pt ({9/pts_per_mm:.1f}mm)  box=130x? pt ({130/pts_per_mm:.1f}mm wide)")
 
+    # Scale callout font size and box width proportionally to page size.
+    # Baseline is A4 width (595 pt); A3 (~841 pt) gets ~43% larger text.
+    # Baselines are intentionally generous so text is clearly readable on print.
+    A4_WIDTH_PT = 595.0
+    callout_font_size = max(14.0, round(14.0 * pdf_w / A4_WIDTH_PT, 1))
+    callout_box_width = max(200.0, round(200.0 * pdf_w / A4_WIDTH_PT))
+    logging.info(f"  Scaled callout: font={callout_font_size}pt  box_width={callout_box_width}pt")
+
     # Count object types
     type_counts: Dict[str, int] = {}
     for obj in objects:
@@ -984,7 +993,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             cx, cy, r, callout_text = item[:4]
             poly_pts = item[4] if len(item) > 4 else None
             try:
-                result = place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, polygon_points=poly_pts, forbidden_rects=polygon_rects, committed_lines=leader_lines)
+                result = place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, font_size=callout_font_size, box_width=callout_box_width, polygon_points=poly_pts, forbidden_rects=polygon_rects, committed_lines=leader_lines)
                 if result:
                     leader_lines.append(result)
             except Exception as e:
@@ -996,7 +1005,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         line_width = max(0.75, min(3.0, page.rect.width * 0.0005))
         for (a_pt, t_pt) in leader_lines:
             la = page.add_line_annot(t_pt, a_pt)
-            la.set_colors(stroke=(1, 0.5, 0))
+            la.set_colors(stroke=(0.75, 0, 0))
             la.set_border(width=line_width)
             la.update()
         logging.info(f"  Drew {len(leader_lines)} leader line(s) on top of all callout boxes (width={line_width:.2f}pt)")
