@@ -438,8 +438,8 @@ def place_callout_annotation(
         marker_radius: float,
         text: str,
         placed_boxes: List[fitz.Rect],
-        font_size: float = 9.0,
-        box_width: float = 130.0,
+        font_size: float = 10.0,
+        max_box_width: float = 200.0,
         gap: float = 15.0,
         polygon_points: List[fitz.Point] = None,
         forbidden_rects: List[fitz.Rect] = None,
@@ -479,17 +479,31 @@ def place_callout_annotation(
     """
     page_rect = page.rect
 
+    # ── Auto-size box width to text content ───────────────────────────────────
+    # Measure natural single-line width, then decide how many lines to wrap into.
+    CHAR_W = font_size * 0.65  # bold Helvetica avg char width
+    natural_width = len(text) * CHAR_W + 10  # single-line width + padding
+
+    # Target: 1-2 lines for short text, up to 3 lines for long text
+    if natural_width <= max_box_width:
+        box_width = min(max_box_width, max(natural_width, font_size * 4))  # at least 4 chars wide
+    else:
+        # Wrap into 2 lines first, 3 if still too wide
+        box_width = min(max_box_width, max(natural_width / 2 + 10, font_size * 6))
+        if box_width > max_box_width:
+            box_width = min(max_box_width, natural_width / 3 + 10)
+    box_width = round(box_width)
+
     # ── Sizing diagnostics (inputs) ───────────────────────────────────────────
     logging.info(
         f"   [sizing-in]  text='{text}' | chars={len(text)}"
         f" | page={page_rect.width:.0f}x{page_rect.height:.0f}pt"
         f" | radius={marker_radius:.1f}pt"
-        f" | font={font_size}pt | box_w={box_width}pt | gap={gap}pt"
+        f" | font={font_size}pt | box_w={box_width}pt | max_box_w={max_box_width}pt | gap={gap}pt"
     )
 
     # ── Estimate box height from line-wrapped text ────────────────────────────
-    # Use 0.65 char-width ratio (vs 0.55 for regular) to account for bold glyphs being wider
-    chars_per_line = max(1, int(box_width / (font_size * 0.65)))
+    chars_per_line = max(1, int(box_width / CHAR_W))
     words = text.split()
     lines: List[str] = []
     current = ""
@@ -522,28 +536,21 @@ def place_callout_annotation(
         f"  radius={marker_radius/page_rect.width*100:.2f}%"
     )
 
-    # ── 8 candidate directions (PDF coords: +y = down) ────────────────────────
-    # Ordered so the most readable directions (E, NE, N …) are tried first.
-    DIRS = [
-        ( 1,  0),   # E
-        ( 1, -1),   # NE
-        ( 0, -1),   # N
-        (-1, -1),   # NW
-        (-1,  0),   # W
-        (-1,  1),   # SW
-        ( 0,  1),   # S
-        ( 1,  1),   # SE
-    ]
+    # ── 16 candidate directions (PDF coords: +y = down) ───────────────────────
+    # 8 cardinal + 8 intermediate for finer placement in crowded layouts.
+    import math
+    DIRS = [(round(math.cos(math.radians(a)), 4), round(math.sin(math.radians(a)), 4))
+            for a in range(0, 360, 22)]  # 0, 22, 45, 67, 90 … 338 → 16 dirs
 
     best_rect: fitz.Rect = None
     best_score = float("inf")  # lower overlap area = better
 
     # Each already-placed rect is expanded by this many points on every side
     # before the overlap check so callout boxes always have breathing room.
-    MARGIN = 6.0
+    MARGIN = 10.0
 
-    # Try expanding distance multipliers; more steps = better escape in crowded layouts.
-    for dist_mult in (1.0, 1.5, 2.0, 2.75, 3.75):
+    # Try expanding distance multipliers — more steps to escape crowded areas.
+    for dist_mult in (1.0, 1.4, 2.0, 2.8, 3.8, 5.0, 7.0):
         effective_dist = min_dist * dist_mult
 
         for dx, dy in DIRS:
@@ -616,7 +623,7 @@ def place_callout_annotation(
     # ── Fallback: if ALL positions intersect a forbidden rect, relax the hard
     # exclusion and just pick the minimum-overlap position (better than nothing).
     if best_rect is None and forbidden_rects:
-        for dist_mult in (1.0, 1.5, 2.0, 2.75, 3.75):
+        for dist_mult in (1.0, 1.4, 2.0, 2.8, 3.8, 5.0, 7.0):
             effective_dist = min_dist * dist_mult
             for dx, dy in DIRS:
                 if dx > 0:
@@ -896,10 +903,19 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         metadata: Metadata containing coordinate system info
 
     Returns:
-        Annotated PDF as bytes
+        Annotated PDF as bytes (returns original bytes unmodified on failure)
     """
+    # Validate PDF content before opening
+    if not pdf_bytes or not pdf_bytes[:5] == b"%PDF-":
+        logging.error(f"Downloaded content is NOT a PDF ({len(pdf_bytes)} bytes, magic={pdf_bytes[:20]!r}). Returning original.")
+        return pdf_bytes
+
     # Open PDF
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if not doc.is_pdf or doc.page_count == 0:
+        logging.error(f"fitz opened file but is_pdf={doc.is_pdf}, pages={doc.page_count}. Returning original.")
+        doc.close()
+        return pdf_bytes
     page = doc[0]  # First page
 
     logging.info(f"=" * 80)
@@ -921,13 +937,34 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"  1 pt = {1/px_per_pt_x:.2f} px (horiz)  |  1 px = {px_per_pt_x:.3f} pt")
     logging.info(f"  Default callout: font=9pt ({9/pts_per_mm:.1f}mm)  box=130x? pt ({130/pts_per_mm:.1f}mm wide)")
 
-    # Scale callout font size and box width proportionally to page size.
-    # Baseline is A4 width (595 pt); A3 (~841 pt) gets ~43% larger text.
-    # Baselines are intentionally generous so text is clearly readable on print.
+    # ── Dynamic callout sizing from page dimensions + annotation density ──────
+    # Step 1: scale up from A4 baseline for larger paper (A3, A1, A0…)
     A4_WIDTH_PT = 595.0
-    callout_font_size = max(14.0, round(14.0 * pdf_w / A4_WIDTH_PT, 1))
-    callout_box_width = max(200.0, round(200.0 * pdf_w / A4_WIDTH_PT))
-    logging.info(f"  Scaled callout: font={callout_font_size}pt  box_width={callout_box_width}pt")
+    page_scale = pdf_w / A4_WIDTH_PT  # 1.0 for A4, ~1.41 for A3, ~2.0 for A1
+
+    # Step 2: count how many callouts we'll place to adjust for density
+    n_callouts = sum(
+        1 for obj in objects
+        if obj.get("overlay") or obj.get("properties", {}).get("overlay")
+        or obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
+    )
+    n_callouts = max(n_callouts, 1)
+
+    # Density factor: shrink when crowded, grow when sparse
+    # 1-4 callouts → 1.0, 8 → ~0.85, 15 → ~0.72, 25 → ~0.63
+    density_factor = min(1.0, (4.0 / n_callouts) ** 0.35) if n_callouts > 4 else 1.0
+
+    # Base font: 10pt at A4 density=1, bold makes it legible at this size
+    BASE_FONT = 10.0
+    callout_font_size = round(max(8.0, BASE_FONT * page_scale * density_factor), 1)
+
+    # box_width will be auto-sized per callout text (see place_callout_annotation)
+    # but provide a max cap as % of page width (never more than 30% of page)
+    callout_max_box_width = round(pdf_w * 0.30)
+
+    logging.info(f"  Dynamic callout: font={callout_font_size}pt"
+                 f"  page_scale={page_scale:.2f}  n_callouts={n_callouts}"
+                 f"  density_factor={density_factor:.2f}  max_box_w={callout_max_box_width}pt")
 
     # Count object types
     type_counts: Dict[str, int] = {}
@@ -988,11 +1025,21 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         logging.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
         # Seed with shape bounding boxes so callouts won't overlap fills/circles.
         placed_boxes: List[fitz.Rect] = list(shape_rects)
+        committed_lines: List[Tuple[fitz.Point, fitz.Point]] = []
         for item in pending_callouts:
             cx, cy, r, callout_text = item[:4]
             poly_pts = item[4] if len(item) > 4 else None
             try:
-                result = place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, font_size=callout_font_size, box_width=callout_box_width, polygon_points=poly_pts, forbidden_rects=polygon_rects)
+                result = place_callout_annotation(
+                    page, cx, cy, r, callout_text, placed_boxes,
+                    font_size=callout_font_size,
+                    max_box_width=callout_max_box_width,
+                    polygon_points=poly_pts,
+                    forbidden_rects=polygon_rects,
+                    committed_lines=committed_lines,
+                )
+                if result:
+                    committed_lines.append(result)
             except Exception as e:
                 logging.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
 
@@ -1000,10 +1047,18 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
 
-    # Save to bytes
+    # Save to bytes — fallback to original if internal state is corrupted
     output = io.BytesIO()
-    doc.save(output)
-    doc.close()
+    try:
+        doc.save(output)
+        doc.close()
+    except (AssertionError, Exception) as save_err:
+        logging.error(f"⚠️  doc.save() failed ({save_err}), returning original PDF unmodified")
+        try:
+            doc.close()
+        except Exception:
+            pass
+        return pdf_bytes
 
     return output.getvalue()
 
