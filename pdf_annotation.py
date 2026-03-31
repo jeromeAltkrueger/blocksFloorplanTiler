@@ -963,6 +963,9 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         geo_type = obj.get("geometry", {}).get("type", "unknown")
         type_counts[geo_type] = type_counts.get(geo_type, 0) + 1
     logging.info(f"  Objects    : {len(objects)} total — " + ", ".join(f"{v}x {k}" for k, v in type_counts.items()))
+    if objects:
+        logging.info(f"  Sample obj[0] keys: {list(objects[0].keys())}")
+        logging.info(f"  Sample obj[0]: {json.dumps(objects[0], default=str)[:500]}")
     logging.info(f"=" * 80)
 
     # Detect whitespace trim offset (needed when PDF had margins that were cropped)
