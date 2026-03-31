@@ -438,8 +438,8 @@ def place_callout_annotation(
         marker_radius: float,
         text: str,
         placed_boxes: List[fitz.Rect],
-        font_size: float = 10.0,
-        max_box_width: float = 200.0,
+        font_size: float = 9.0,
+        box_width: float = 130.0,
         gap: float = 15.0,
         polygon_points: List[fitz.Point] = None,
         forbidden_rects: List[fitz.Rect] = None,
@@ -479,31 +479,17 @@ def place_callout_annotation(
     """
     page_rect = page.rect
 
-    # ── Auto-size box width to text content ───────────────────────────────────
-    # Measure natural single-line width, then decide how many lines to wrap into.
-    CHAR_W = font_size * 0.65  # bold Helvetica avg char width
-    natural_width = len(text) * CHAR_W + 10  # single-line width + padding
-
-    # Target: 1-2 lines for short text, up to 3 lines for long text
-    if natural_width <= max_box_width:
-        box_width = min(max_box_width, max(natural_width, font_size * 4))  # at least 4 chars wide
-    else:
-        # Wrap into 2 lines first, 3 if still too wide
-        box_width = min(max_box_width, max(natural_width / 2 + 10, font_size * 6))
-        if box_width > max_box_width:
-            box_width = min(max_box_width, natural_width / 3 + 10)
-    box_width = round(box_width)
-
     # ── Sizing diagnostics (inputs) ───────────────────────────────────────────
     logging.info(
         f"   [sizing-in]  text='{text}' | chars={len(text)}"
         f" | page={page_rect.width:.0f}x{page_rect.height:.0f}pt"
         f" | radius={marker_radius:.1f}pt"
-        f" | font={font_size}pt | box_w={box_width}pt | max_box_w={max_box_width}pt | gap={gap}pt"
+        f" | font={font_size}pt | box_w={box_width}pt | gap={gap}pt"
     )
 
     # ── Estimate box height from line-wrapped text ────────────────────────────
-    chars_per_line = max(1, int(box_width / CHAR_W))
+    # Use 0.65 char-width ratio (vs 0.55 for regular) to account for bold glyphs being wider
+    chars_per_line = max(1, int(box_width / (font_size * 0.65)))
     words = text.split()
     lines: List[str] = []
     current = ""
@@ -536,21 +522,28 @@ def place_callout_annotation(
         f"  radius={marker_radius/page_rect.width*100:.2f}%"
     )
 
-    # ── 16 candidate directions (PDF coords: +y = down) ───────────────────────
-    # 8 cardinal + 8 intermediate for finer placement in crowded layouts.
-    import math
-    DIRS = [(round(math.cos(math.radians(a)), 4), round(math.sin(math.radians(a)), 4))
-            for a in range(0, 360, 22)]  # 0, 22, 45, 67, 90 … 338 → 16 dirs
+    # ── 8 candidate directions (PDF coords: +y = down) ────────────────────────
+    # Ordered so the most readable directions (E, NE, N …) are tried first.
+    DIRS = [
+        ( 1,  0),   # E
+        ( 1, -1),   # NE
+        ( 0, -1),   # N
+        (-1, -1),   # NW
+        (-1,  0),   # W
+        (-1,  1),   # SW
+        ( 0,  1),   # S
+        ( 1,  1),   # SE
+    ]
 
     best_rect: fitz.Rect = None
     best_score = float("inf")  # lower overlap area = better
 
     # Each already-placed rect is expanded by this many points on every side
     # before the overlap check so callout boxes always have breathing room.
-    MARGIN = 10.0
+    MARGIN = 6.0
 
-    # Try expanding distance multipliers — more steps to escape crowded areas.
-    for dist_mult in (1.0, 1.4, 2.0, 2.8, 3.8, 5.0, 7.0):
+    # Try expanding distance multipliers; more steps = better escape in crowded layouts.
+    for dist_mult in (1.0, 1.5, 2.0, 2.75, 3.75):
         effective_dist = min_dist * dist_mult
 
         for dx, dy in DIRS:
@@ -623,7 +616,7 @@ def place_callout_annotation(
     # ── Fallback: if ALL positions intersect a forbidden rect, relax the hard
     # exclusion and just pick the minimum-overlap position (better than nothing).
     if best_rect is None and forbidden_rects:
-        for dist_mult in (1.0, 1.4, 2.0, 2.8, 3.8, 5.0, 7.0):
+        for dist_mult in (1.0, 1.5, 2.0, 2.75, 3.75):
             effective_dist = min_dist * dist_mult
             for dx, dy in DIRS:
                 if dx > 0:
@@ -893,7 +886,7 @@ async def download_file(url: str) -> bytes:
 
 
 def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
-                metadata: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
+                metadata: Dict[str, Any]) -> bytes:
     """
     Annotate a PDF with shapes and markers.
 
@@ -903,38 +896,10 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         metadata: Metadata containing coordinate system info
 
     Returns:
-        Tuple of (annotated PDF bytes, diagnostics dict)
+        Annotated PDF as bytes
     """
-    diag: Dict[str, Any] = {"objects_total": len(objects), "objects_drawn": 0,
-                             "callouts_placed": 0, "errors": [], "save_ok": True,
-                             "pymupdf_version": fitz.__version__}
-
-    if objects:
-        diag["sample_object"] = json.dumps(objects[0], default=str)[:500]
-
-    # Validate PDF content
-    diag["pdf_bytes_len"] = len(pdf_bytes)
-    diag["pdf_magic"] = pdf_bytes[:20].hex() if pdf_bytes else "empty"
-    is_pdf = pdf_bytes[:5] == b"%PDF-"
-    diag["is_valid_pdf"] = is_pdf
-    logging.info(f"PDF validation: {len(pdf_bytes)} bytes, magic={pdf_bytes[:20]!r}, is_pdf={is_pdf}")
-
-    if not is_pdf:
-        diag["errors"].append(f"Downloaded content is NOT a PDF. First 100 bytes: {pdf_bytes[:100]!r}")
-        diag["save_ok"] = False
-        return (pdf_bytes, diag)
-
     # Open PDF
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    diag["doc_is_pdf"] = doc.is_pdf
-    diag["doc_page_count"] = doc.page_count
-    logging.info(f"fitz.open: is_pdf={doc.is_pdf}, pages={doc.page_count}")
-
-    if not doc.is_pdf:
-        diag["errors"].append(f"fitz opened file but is_pdf={doc.is_pdf}")
-        doc.close()
-        return (pdf_bytes, diag)
-
     page = doc[0]  # First page
 
     logging.info(f"=" * 80)
@@ -956,34 +921,13 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"  1 pt = {1/px_per_pt_x:.2f} px (horiz)  |  1 px = {px_per_pt_x:.3f} pt")
     logging.info(f"  Default callout: font=9pt ({9/pts_per_mm:.1f}mm)  box=130x? pt ({130/pts_per_mm:.1f}mm wide)")
 
-    # ── Dynamic callout sizing from page dimensions + annotation density ──────
-    # Step 1: scale up from A4 baseline for larger paper (A3, A1, A0…)
+    # Scale callout font size and box width proportionally to page size.
+    # Baseline is A4 width (595 pt); A3 (~841 pt) gets ~43% larger text.
+    # Baselines are intentionally generous so text is clearly readable on print.
     A4_WIDTH_PT = 595.0
-    page_scale = pdf_w / A4_WIDTH_PT  # 1.0 for A4, ~1.41 for A3, ~2.0 for A1
-
-    # Step 2: count how many callouts we'll place to adjust for density
-    n_callouts = sum(
-        1 for obj in objects
-        if obj.get("overlay") or obj.get("properties", {}).get("overlay")
-        or obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
-    )
-    n_callouts = max(n_callouts, 1)
-
-    # Density factor: shrink when crowded, grow when sparse
-    # 1-4 callouts → 1.0, 8 → ~0.85, 15 → ~0.72, 25 → ~0.63
-    density_factor = min(1.0, (4.0 / n_callouts) ** 0.35) if n_callouts > 4 else 1.0
-
-    # Base font: 10pt at A4 density=1, bold makes it legible at this size
-    BASE_FONT = 10.0
-    callout_font_size = round(max(8.0, BASE_FONT * page_scale * density_factor), 1)
-
-    # box_width will be auto-sized per callout text (see place_callout_annotation)
-    # but provide a max cap as % of page width (never more than 30% of page)
-    callout_max_box_width = round(pdf_w * 0.30)
-
-    logging.info(f"  Dynamic callout: font={callout_font_size}pt"
-                 f"  page_scale={page_scale:.2f}  n_callouts={n_callouts}"
-                 f"  density_factor={density_factor:.2f}  max_box_w={callout_max_box_width}pt")
+    callout_font_size = max(14.0, round(14.0 * pdf_w / A4_WIDTH_PT, 1))
+    callout_box_width = max(200.0, round(200.0 * pdf_w / A4_WIDTH_PT))
+    logging.info(f"  Scaled callout: font={callout_font_size}pt  box_width={callout_box_width}pt")
 
     # Count object types
     type_counts: Dict[str, int] = {}
@@ -991,9 +935,6 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         geo_type = obj.get("geometry", {}).get("type", "unknown")
         type_counts[geo_type] = type_counts.get(geo_type, 0) + 1
     logging.info(f"  Objects    : {len(objects)} total — " + ", ".join(f"{v}x {k}" for k, v in type_counts.items()))
-    if objects:
-        logging.info(f"  Sample obj[0] keys: {list(objects[0].keys())}")
-        logging.info(f"  Sample obj[0]: {json.dumps(objects[0], default=str)[:500]}")
     logging.info(f"=" * 80)
 
     # Detect whitespace trim offset (needed when PDF had margins that were cropped)
@@ -1017,12 +958,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             geo_type = geometry.get("type")
             coordinates = geometry.get("coordinates", [])
 
-            logging.info(f"Type: {obj_type}, Geometry: {geo_type}, keys: {list(obj.keys())}")
-            if not geo_type:
-                err_msg = f"Object {i+1}: no geometry.type — obj keys: {list(obj.keys())}, geometry keys: {list(geometry.keys())}"
-                logging.warning(f"  ⚠️  {err_msg}")
-                diag["errors"].append(err_msg)
-                continue
+            logging.info(f"Type: {obj_type}, Geometry: {geo_type}")
 
             if geo_type == "Polygon":
                 config = ANNOTATION_CONFIG["polygon"].copy()
@@ -1042,9 +978,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                 logging.warning(f"⚠️  Unknown type: {obj_type}")
 
         except Exception as e:
-            err_msg = f"Object {i+1} ({geo_type}): {str(e)}"
             logging.error(f"❌ Error drawing object {i + 1}: {str(e)}", exc_info=True)
-            diag["errors"].append(err_msg)
             continue
 
     # ── Place deferred Callout annotations ──────────────────────────────────
@@ -1054,47 +988,24 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         logging.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
         # Seed with shape bounding boxes so callouts won't overlap fills/circles.
         placed_boxes: List[fitz.Rect] = list(shape_rects)
-        committed_lines: List[Tuple[fitz.Point, fitz.Point]] = []
         for item in pending_callouts:
             cx, cy, r, callout_text = item[:4]
             poly_pts = item[4] if len(item) > 4 else None
             try:
-                result = place_callout_annotation(
-                    page, cx, cy, r, callout_text, placed_boxes,
-                    font_size=callout_font_size,
-                    max_box_width=callout_max_box_width,
-                    polygon_points=poly_pts,
-                    forbidden_rects=polygon_rects,
-                    committed_lines=committed_lines,
-                )
-                if result:
-                    committed_lines.append(result)
+                result = place_callout_annotation(page, cx, cy, r, callout_text, placed_boxes, font_size=callout_font_size, box_width=callout_box_width, polygon_points=poly_pts, forbidden_rects=polygon_rects)
             except Exception as e:
                 logging.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
-
-    diag["objects_drawn"] = objects_drawn
-    diag["callouts_placed"] = len(pending_callouts)
 
     logging.info(f"\n{'=' * 80}")
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
 
-    # Save to bytes — with fallback if PyMuPDF internal state was corrupted
+    # Save to bytes
     output = io.BytesIO()
-    try:
-        doc.save(output)
-        doc.close()
-    except (AssertionError, Exception) as save_err:
-        logging.error(f"⚠️  doc.save() failed ({save_err}), returning original PDF unmodified")
-        diag["save_ok"] = False
-        diag["errors"].append(f"doc.save() failed: {save_err}")
-        try:
-            doc.close()
-        except Exception:
-            pass
-        return (pdf_bytes, diag)
+    doc.save(output)
+    doc.close()
 
-    return (output.getvalue(), diag)
+    return output.getvalue()
 
 
 # ==========================================
@@ -1197,7 +1108,7 @@ def register_routes(app: func.FunctionApp):
 
             # Annotate PDF
             logging.info("🎨 Annotating PDF...")
-            annotated_pdf_bytes, _diag = annotate_pdf(pdf_bytes, objects, metadata)
+            annotated_pdf_bytes = annotate_pdf(pdf_bytes, objects, metadata)
             logging.info(f"✅ PDF annotated: {len(annotated_pdf_bytes)} bytes")
 
             # Generate filename with timestamp
