@@ -986,7 +986,10 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             geo_type = geometry.get("type")
             coordinates = geometry.get("coordinates", [])
 
-            logging.info(f"Type: {obj_type}, Geometry: {geo_type}")
+            logging.info(f"Type: {obj_type}, Geometry: {geo_type}, keys: {list(obj.keys())}")
+            if not geo_type:
+                logging.warning(f"  ⚠️  No geometry.type — raw obj keys: {list(obj.keys())}, geometry keys: {list(geometry.keys())}")
+                continue
 
             if geo_type == "Polygon":
                 config = ANNOTATION_CONFIG["polygon"].copy()
@@ -1038,10 +1041,18 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
 
-    # Save to bytes
+    # Save to bytes — with fallback if PyMuPDF internal state was corrupted
     output = io.BytesIO()
-    doc.save(output)
-    doc.close()
+    try:
+        doc.save(output)
+        doc.close()
+    except (AssertionError, Exception) as save_err:
+        logging.error(f"⚠️  doc.save() failed ({save_err}), returning original PDF unmodified")
+        try:
+            doc.close()
+        except Exception:
+            pass
+        return pdf_bytes
 
     return output.getvalue()
 
