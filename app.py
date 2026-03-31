@@ -1439,7 +1439,7 @@ async def pdf_annotation_endpoint(request: PdfAnnotationRequest,
 
         # Annotate PDF
         logger.info("🎨 Annotating PDF...")
-        annotated_pdf_bytes, annotation_diag = pdf_annotation.annotate_pdf(pdf_bytes, objects, metadata)
+        annotated_pdf_bytes = pdf_annotation.annotate_pdf(pdf_bytes, objects, metadata)
         changed = len(annotated_pdf_bytes) != len(pdf_bytes)
         logger.info(f"✅ PDF annotated: {len(annotated_pdf_bytes)} bytes (original: {len(pdf_bytes)} bytes, {'MODIFIED' if changed else 'UNCHANGED — fallback used'})")
 
@@ -1483,7 +1483,6 @@ async def pdf_annotation_endpoint(request: PdfAnnotationRequest,
             "success": True,
             "annotated_pdf_url": annotated_pdf_url,
             "filename": annotated_filename,
-            "annotation_diagnostics": annotation_diag,
             "metadata": {
                 "floorplan_id": metadata.get("floorplan_id"),
                 "source_url": file_url
