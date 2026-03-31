@@ -893,7 +893,7 @@ async def download_file(url: str) -> bytes:
 
 
 def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
-                metadata: Dict[str, Any]) -> bytes:
+                metadata: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
     """
     Annotate a PDF with shapes and markers.
 
@@ -903,8 +903,14 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         metadata: Metadata containing coordinate system info
 
     Returns:
-        Annotated PDF as bytes
+        Tuple of (annotated PDF bytes, diagnostics dict)
     """
+    diag: Dict[str, Any] = {"objects_total": len(objects), "objects_drawn": 0,
+                             "callouts_placed": 0, "errors": [], "save_ok": True}
+
+    if objects:
+        diag["sample_object"] = json.dumps(objects[0], default=str)[:500]
+
     # Open PDF
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]  # First page
@@ -991,7 +997,9 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
 
             logging.info(f"Type: {obj_type}, Geometry: {geo_type}, keys: {list(obj.keys())}")
             if not geo_type:
-                logging.warning(f"  ⚠️  No geometry.type — raw obj keys: {list(obj.keys())}, geometry keys: {list(geometry.keys())}")
+                err_msg = f"Object {i+1}: no geometry.type — obj keys: {list(obj.keys())}, geometry keys: {list(geometry.keys())}"
+                logging.warning(f"  ⚠️  {err_msg}")
+                diag["errors"].append(err_msg)
                 continue
 
             if geo_type == "Polygon":
@@ -1012,7 +1020,9 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                 logging.warning(f"⚠️  Unknown type: {obj_type}")
 
         except Exception as e:
+            err_msg = f"Object {i+1} ({geo_type}): {str(e)}"
             logging.error(f"❌ Error drawing object {i + 1}: {str(e)}", exc_info=True)
+            diag["errors"].append(err_msg)
             continue
 
     # ── Place deferred Callout annotations ──────────────────────────────────
@@ -1040,6 +1050,9 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             except Exception as e:
                 logging.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
 
+    diag["objects_drawn"] = objects_drawn
+    diag["callouts_placed"] = len(pending_callouts)
+
     logging.info(f"\n{'=' * 80}")
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
@@ -1051,13 +1064,15 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         doc.close()
     except (AssertionError, Exception) as save_err:
         logging.error(f"⚠️  doc.save() failed ({save_err}), returning original PDF unmodified")
+        diag["save_ok"] = False
+        diag["errors"].append(f"doc.save() failed: {save_err}")
         try:
             doc.close()
         except Exception:
             pass
-        return pdf_bytes
+        return (pdf_bytes, diag)
 
-    return output.getvalue()
+    return (output.getvalue(), diag)
 
 
 # ==========================================
@@ -1160,7 +1175,7 @@ def register_routes(app: func.FunctionApp):
 
             # Annotate PDF
             logging.info("🎨 Annotating PDF...")
-            annotated_pdf_bytes = annotate_pdf(pdf_bytes, objects, metadata)
+            annotated_pdf_bytes, _diag = annotate_pdf(pdf_bytes, objects, metadata)
             logging.info(f"✅ PDF annotated: {len(annotated_pdf_bytes)} bytes")
 
             # Generate filename with timestamp
