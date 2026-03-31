@@ -431,6 +431,28 @@ def _segments_intersect(p1: fitz.Point, p2: fitz.Point,
             ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)))
 
 
+def _segment_intersects_rect(p1: fitz.Point, p2: fitz.Point,
+                             rect: fitz.Rect) -> bool:
+    """Return True if line segment p1-p2 passes through or touches *rect*.
+
+    Checks:
+      1. Either endpoint inside the rect → True.
+      2. Segment crosses any of the 4 rect edges → True.
+    """
+    if rect.contains(p1) or rect.contains(p2):
+        return True
+    corners = [
+        (fitz.Point(rect.x0, rect.y0), fitz.Point(rect.x1, rect.y0)),  # top
+        (fitz.Point(rect.x1, rect.y0), fitz.Point(rect.x1, rect.y1)),  # right
+        (fitz.Point(rect.x1, rect.y1), fitz.Point(rect.x0, rect.y1)),  # bottom
+        (fitz.Point(rect.x0, rect.y1), fitz.Point(rect.x0, rect.y0)),  # left
+    ]
+    for c1, c2 in corners:
+        if _segments_intersect(p1, p2, c1, c2):
+            return True
+    return False
+
+
 def place_callout_annotation(
         page: fitz.Page,
         marker_x: float,
@@ -443,7 +465,8 @@ def place_callout_annotation(
         gap: float = 15.0,
         polygon_points: List[fitz.Point] = None,
         forbidden_rects: List[fitz.Rect] = None,
-        committed_lines: List[Tuple[fitz.Point, fitz.Point]] = None) -> None:
+        committed_lines: List[Tuple[fitz.Point, fitz.Point]] = None,
+        marker_zones: List[fitz.Rect] = None) -> None:
     """
     Add a Callout FreeText annotation.
 
@@ -545,14 +568,23 @@ def place_callout_annotation(
     best_rect: fitz.Rect = None
     best_score = float("inf")  # lower overlap area = better
 
-    # Each already-placed rect is expanded by this many points on every side
-    # before the overlap check so callout boxes always have breathing room.
-    MARGIN = 10.0
+    # Breathing room between neighbouring boxes (3× font for readable gap)
+    MARGIN = font_size * 3.0
 
-    # Try expanding distance multipliers — more steps to escape crowded areas.
-    for dist_mult in (1.0, 1.4, 2.0, 2.8, 3.8, 5.0, 7.0):
-        effective_dist = min_dist * dist_mult
+    # Distance steps: reach far across the page so boxes spread to open space.
+    # On a 3370pt page with min_dist=25pt, the largest step places the box
+    # ~670pt away (20% of page width) — enough to escape dense clusters.
+    page_diag = (page_rect.width ** 2 + page_rect.height ** 2) ** 0.5
+    DIST_STEPS = [
+        min_dist * m for m in (1.0, 1.5, 2.2, 3.2, 5.0, 8.0, 12.0, 18.0, 26.0)
+    ]
+    # Cap so no step exceeds 25% of page diagonal
+    DIST_STEPS = [min(d, page_diag * 0.25) for d in DIST_STEPS]
 
+    # Helper: compute score for a candidate box position
+    BIG_PENALTY = page_rect.width * page_rect.height  # used for hard violations
+
+    for effective_dist in DIST_STEPS:
         for dx, dy in DIRS:
             # Position the box so its nearest edge is exactly effective_dist from center
             if dx > 0:
@@ -576,8 +608,6 @@ def place_callout_annotation(
                 continue
 
             # Hard exclusion: polygon fill areas must never be covered.
-            # Any intersection (even tiny) gives infinite penalty so the
-            # algorithm always prefers a position clear of polygon fills.
             if forbidden_rects:
                 forbidden = False
                 for frect in forbidden_rects:
@@ -587,34 +617,50 @@ def place_callout_annotation(
                 if forbidden:
                     continue  # skip — try next direction / distance
 
-            # Compute total overlap area against already-placed boxes + margin
-            overlap = 0.0
+            score = 0.0
+
+            # ── Penalty: overlap with already-placed boxes (with margin) ──
             for placed in placed_boxes:
                 padded = placed + (-MARGIN, -MARGIN, MARGIN, MARGIN)
                 inter = candidate & padded
                 if not inter.is_empty:
-                    overlap += inter.width * inter.height
+                    score += inter.width * inter.height
 
-            # Crossing penalty: compute the proposed leader line for this
-            # candidate and count how many committed lines it would cross.
-            # One crossing costs more than a full box overlap so the optimiser
-            # strongly prefers non-crossing placements without breaking ties
-            # in impossible layouts.
+            # ── Penalty: box covers a marker safe zone ────────────────────
+            if marker_zones:
+                for mz in marker_zones:
+                    inter = candidate & mz
+                    if not inter.is_empty:
+                        score += inter.width * inter.height * 5  # strong penalty
+
+            # ── Compute proposed leader line for crossing/intersection checks
+            ccx0, ccy0, ccx1, ccy1 = candidate.x0, candidate.y0, candidate.x1, candidate.y1
+            cax = ccx0 if marker_x <= ccx0 else (ccx1 if marker_x >= ccx1 else (ccx0 + ccx1) / 2)
+            cay = ccy0 if marker_y <= ccy0 else (ccy1 if marker_y >= ccy1 else (ccy0 + ccy1) / 2)
+            c_attach = fitz.Point(cax, cay)
+            c_tip = (_closest_point_on_polygon(c_attach, polygon_points)
+                     if polygon_points else fitz.Point(marker_x, marker_y))
+
             if committed_lines:
-                # Attach point for this candidate (same logic as the final block)
-                ccx0, ccy0, ccx1, ccy1 = candidate.x0, candidate.y0, candidate.x1, candidate.y1
-                cax = ccx0 if marker_x <= ccx0 else (ccx1 if marker_x >= ccx1 else (ccx0 + ccx1) / 2)
-                cay = ccy0 if marker_y <= ccy0 else (ccy1 if marker_y >= ccy1 else (ccy0 + ccy1) / 2)
-                c_attach = fitz.Point(cax, cay)
-                c_tip = (_closest_point_on_polygon(c_attach, polygon_points)
-                         if polygon_points else fitz.Point(marker_x, marker_y))
-                crossing_penalty = page_rect.width * page_rect.height * 0.001
+                # ── Penalty: leader line crosses another leader line ──────
                 for (cl_a, cl_t) in committed_lines:
                     if _segments_intersect(c_attach, c_tip, cl_a, cl_t):
-                        overlap += crossing_penalty
+                        score += BIG_PENALTY * 0.01  # strong preference to avoid
 
-            if overlap < best_score:
-                best_score = overlap
+                # ── Penalty: proposed leader line passes through an
+                #    already-placed box (line must not cross boxes) ─────────
+                for placed in placed_boxes:
+                    if _segment_intersects_rect(c_attach, c_tip, placed):
+                        score += BIG_PENALTY * 0.005
+
+            # ── Penalty: existing committed lines pass through this box ───
+            if committed_lines:
+                for (cl_a, cl_t) in committed_lines:
+                    if _segment_intersects_rect(cl_a, cl_t, candidate):
+                        score += BIG_PENALTY * 0.005
+
+            if score < best_score:
+                best_score = score
                 best_rect = candidate
 
         if best_score == 0.0:
@@ -623,8 +669,7 @@ def place_callout_annotation(
     # ── Fallback: if ALL positions intersect a forbidden rect, relax the hard
     # exclusion and just pick the minimum-overlap position (better than nothing).
     if best_rect is None and forbidden_rects:
-        for dist_mult in (1.0, 1.4, 2.0, 2.8, 3.8, 5.0, 7.0):
-            effective_dist = min_dist * dist_mult
+        for effective_dist in DIST_STEPS:
             for dx, dy in DIRS:
                 if dx > 0:
                     bx0 = marker_x + effective_dist
@@ -647,17 +692,6 @@ def place_callout_annotation(
                     inter = candidate & padded
                     if not inter.is_empty:
                         overlap += inter.width * inter.height
-                if committed_lines:
-                    ccx0, ccy0, ccx1, ccy1 = candidate.x0, candidate.y0, candidate.x1, candidate.y1
-                    cax = ccx0 if marker_x <= ccx0 else (ccx1 if marker_x >= ccx1 else (ccx0 + ccx1) / 2)
-                    cay = ccy0 if marker_y <= ccy0 else (ccy1 if marker_y >= ccy1 else (ccy0 + ccy1) / 2)
-                    c_attach = fitz.Point(cax, cay)
-                    c_tip = (_closest_point_on_polygon(c_attach, polygon_points)
-                             if polygon_points else fitz.Point(marker_x, marker_y))
-                    crossing_penalty = page_rect.width * page_rect.height * 0.001
-                    for (cl_a, cl_t) in committed_lines:
-                        if _segments_intersect(c_attach, c_tip, cl_a, cl_t):
-                            overlap += crossing_penalty
                 if overlap < best_score:
                     best_score = overlap
                     best_rect = candidate
@@ -938,9 +972,11 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"  Default callout: font=9pt ({9/pts_per_mm:.1f}mm)  box=130x? pt ({130/pts_per_mm:.1f}mm wide)")
 
     # ── Dynamic callout sizing from page dimensions + annotation density ──────
-    # Step 1: scale up from A4 baseline for larger paper (A3, A1, A0…)
+    # Font should be small & fixed-ish — annotations are read at arm's length
+    # regardless of paper size.  Use a gentle log scale, not linear.
+    import math as _math
     A4_WIDTH_PT = 595.0
-    page_scale = pdf_w / A4_WIDTH_PT  # 1.0 for A4, ~1.41 for A3, ~2.0 for A1
+    page_scale = pdf_w / A4_WIDTH_PT  # 1.0 for A4, ~1.41 for A3, ~5.66 for A0
 
     # Step 2: count how many callouts we'll place to adjust for density
     n_callouts = sum(
@@ -950,21 +986,15 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     )
     n_callouts = max(n_callouts, 1)
 
-    # Density factor: shrink when crowded, grow when sparse
-    # 1-4 callouts → 1.0, 8 → ~0.85, 15 → ~0.72, 25 → ~0.63
-    density_factor = min(1.0, (4.0 / n_callouts) ** 0.35) if n_callouts > 4 else 1.0
+    # Font: 8pt on A4, ~9pt on A3, ~10pt on A1, ~11pt on A0 — cap at 12pt
+    callout_font_size = round(min(12.0, 8.0 + 2.0 * _math.log2(max(1.0, page_scale))), 1)
 
-    # Base font: 10pt at A4 density=1, bold makes it legible at this size
-    BASE_FONT = 10.0
-    callout_font_size = round(max(8.0, BASE_FONT * page_scale * density_factor), 1)
-
-    # box_width will be auto-sized per callout text (see place_callout_annotation)
-    # but provide a max cap as % of page width (never more than 30% of page)
-    callout_max_box_width = round(pdf_w * 0.30)
+    # Box width cap: 8% of page width — compact labels, not billboards
+    callout_max_box_width = round(pdf_w * 0.08)
 
     logging.info(f"  Dynamic callout: font={callout_font_size}pt"
                  f"  page_scale={page_scale:.2f}  n_callouts={n_callouts}"
-                 f"  density_factor={density_factor:.2f}  max_box_w={callout_max_box_width}pt")
+                 f"  max_box_w={callout_max_box_width}pt ({callout_max_box_width/pdf_w*100:.0f}%)")
 
     # Count object types
     type_counts: Dict[str, int] = {}
@@ -986,6 +1016,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     pending_callouts: List[Tuple[float, float, float, str]] = []
     shape_rects: List[fitz.Rect] = []   # bounding rects of all burned shapes
     polygon_rects: List[fitz.Rect] = [] # hard-exclusion zones (polygon fills)
+    marker_zones: List[fitz.Rect] = []  # safe zones around each marker (boxes must not cover)
     objects_drawn = 0
     for i, obj in enumerate(objects):
         try:
@@ -1023,6 +1054,14 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # page with no shape outlines interfering with the overlap check.
     if pending_callouts:
         logging.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
+        # Build marker safe zones: a padded rect around each marker/polygon anchor
+        # that text boxes should avoid covering.
+        SAFE_PAD = 8.0  # extra clearance beyond the marker radius
+        for item in pending_callouts:
+            mx, my, mr = item[0], item[1], item[2]
+            pad = mr + SAFE_PAD
+            marker_zones.append(fitz.Rect(mx - pad, my - pad, mx + pad, my + pad))
+
         # Seed with shape bounding boxes so callouts won't overlap fills/circles.
         placed_boxes: List[fitz.Rect] = list(shape_rects)
         committed_lines: List[Tuple[fitz.Point, fitz.Point]] = []
@@ -1037,6 +1076,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                     polygon_points=poly_pts,
                     forbidden_rects=polygon_rects,
                     committed_lines=committed_lines,
+                    marker_zones=marker_zones,
                 )
                 if result:
                     committed_lines.append(result)
