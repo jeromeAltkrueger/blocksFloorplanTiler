@@ -906,13 +906,35 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         Tuple of (annotated PDF bytes, diagnostics dict)
     """
     diag: Dict[str, Any] = {"objects_total": len(objects), "objects_drawn": 0,
-                             "callouts_placed": 0, "errors": [], "save_ok": True}
+                             "callouts_placed": 0, "errors": [], "save_ok": True,
+                             "pymupdf_version": fitz.__version__}
 
     if objects:
         diag["sample_object"] = json.dumps(objects[0], default=str)[:500]
 
+    # Validate PDF content
+    diag["pdf_bytes_len"] = len(pdf_bytes)
+    diag["pdf_magic"] = pdf_bytes[:20].hex() if pdf_bytes else "empty"
+    is_pdf = pdf_bytes[:5] == b"%PDF-"
+    diag["is_valid_pdf"] = is_pdf
+    logging.info(f"PDF validation: {len(pdf_bytes)} bytes, magic={pdf_bytes[:20]!r}, is_pdf={is_pdf}")
+
+    if not is_pdf:
+        diag["errors"].append(f"Downloaded content is NOT a PDF. First 100 bytes: {pdf_bytes[:100]!r}")
+        diag["save_ok"] = False
+        return (pdf_bytes, diag)
+
     # Open PDF
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    diag["doc_is_pdf"] = doc.is_pdf
+    diag["doc_page_count"] = doc.page_count
+    logging.info(f"fitz.open: is_pdf={doc.is_pdf}, pages={doc.page_count}")
+
+    if not doc.is_pdf:
+        diag["errors"].append(f"fitz opened file but is_pdf={doc.is_pdf}")
+        doc.close()
+        return (pdf_bytes, diag)
+
     page = doc[0]  # First page
 
     logging.info(f"=" * 80)
