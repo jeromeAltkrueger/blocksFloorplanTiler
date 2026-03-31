@@ -975,8 +975,8 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # Font should be small & fixed-ish — annotations are read at arm's length
     # regardless of paper size.  Use a gentle log scale, not linear.
     import math as _math
-    A4_WIDTH_PT = 595.0
-    page_scale = pdf_w / A4_WIDTH_PT  # 1.0 for A4, ~1.41 for A3, ~5.66 for A0
+    A4_AREA = 595.0 * 842.0  # A4 reference area in pt²
+    page_scale = _math.sqrt(pdf_w * pdf_h / A4_AREA)  # 1.0 for A4, ~1.41 A3, ~4.0 A0
 
     # Step 2: count how many callouts we'll place to adjust for density
     n_callouts = sum(
@@ -986,11 +986,11 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     )
     n_callouts = max(n_callouts, 1)
 
-    # Font: 9pt on A4, ~10.5pt on A3, ~13pt on A1, 14pt on A0
-    callout_font_size = round(min(14.0, 9.0 + 3.0 * _math.log2(max(1.0, page_scale))), 1)
+    # Font: ~13.5pt on A4, ~15pt on A3, ~19pt on A1, ~21pt on A0
+    callout_font_size = round(min(21.0, (9.0 + 3.0 * _math.log2(max(1.0, page_scale))) * 1.5), 1)
 
-    # Box width cap: 12% of page width — readable but still compact
-    callout_max_box_width = round(pdf_w * 0.12)
+    # Box width cap: 15% of page width
+    callout_max_box_width = round(pdf_w * 0.15)
 
     logging.info(f"  Dynamic callout: font={callout_font_size}pt"
                  f"  page_scale={page_scale:.2f}  n_callouts={n_callouts}"
