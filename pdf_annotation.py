@@ -986,11 +986,11 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     )
     n_callouts = max(n_callouts, 1)
 
-    # Font: 8pt on A4, ~9pt on A3, ~10pt on A1, ~11pt on A0 — cap at 12pt
-    callout_font_size = round(min(12.0, 8.0 + 2.0 * _math.log2(max(1.0, page_scale))), 1)
+    # Font: 9pt on A4, ~10.5pt on A3, ~13pt on A1, 14pt on A0
+    callout_font_size = round(min(14.0, 9.0 + 3.0 * _math.log2(max(1.0, page_scale))), 1)
 
-    # Box width cap: 8% of page width — compact labels, not billboards
-    callout_max_box_width = round(pdf_w * 0.08)
+    # Box width cap: 12% of page width — readable but still compact
+    callout_max_box_width = round(pdf_w * 0.12)
 
     logging.info(f"  Dynamic callout: font={callout_font_size}pt"
                  f"  page_scale={page_scale:.2f}  n_callouts={n_callouts}"
