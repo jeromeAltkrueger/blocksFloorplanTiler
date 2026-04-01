@@ -561,8 +561,18 @@ def place_callout_annotation(
 
     # ── 24 candidate directions (PDF coords: +y = down) ───────────────────────
     import math
-    DIRS = [(round(math.cos(math.radians(a)), 4), round(math.sin(math.radians(a)), 4))
-            for a in range(0, 360, 15)]  # every 15° → 24 directions
+    # Use exact direction tuples for cardinal/ordinal, computed for intermediates
+    DIRS = []
+    for a in range(0, 360, 15):
+        rad = math.radians(a)
+        dx = round(math.cos(rad), 6)
+        dy = round(math.sin(rad), 6)
+        # Snap near-zero values to exactly 0 so cardinal placement works
+        if abs(dx) < 0.01:
+            dx = 0.0
+        if abs(dy) < 0.01:
+            dy = 0.0
+        DIRS.append((dx, dy))
 
     best_rect: fitz.Rect = None
     best_score = float("inf")  # lower = better; 0 = perfect
@@ -573,10 +583,13 @@ def place_callout_annotation(
     # Distance steps: reach far across the page so boxes spread to open space.
     page_diag = (page_rect.width ** 2 + page_rect.height ** 2) ** 0.5
     DIST_STEPS = [
-        min_dist * m for m in (1.0, 1.5, 2.2, 3.2, 5.0, 8.0, 12.0, 18.0, 26.0, 38.0, 55.0)
+        min_dist * m for m in (1.0, 1.5, 2.2, 3.2, 5.0, 8.0, 12.0, 18.0, 26.0, 38.0, 55.0, 80.0)
     ]
-    # Cap so no step exceeds 35% of page diagonal
-    DIST_STEPS = [min(d, page_diag * 0.35) for d in DIST_STEPS]
+    # Cap so no step exceeds 45% of page diagonal (allows reaching far corners)
+    DIST_STEPS = [min(d, page_diag * 0.45) for d in DIST_STEPS]
+    # Deduplicate after capping
+    seen = set()
+    DIST_STEPS = [d for d in DIST_STEPS if not (round(d, 1) in seen or seen.add(round(d, 1)))]
 
     # ── PASS 1: find a CLEAN placement (no overlaps, no crossings) ────────────
     # All violations are hard-reject. Only score by leader-line length (prefer short).
@@ -653,12 +666,13 @@ def place_callout_annotation(
                 best_score = dist_score
                 best_rect = candidate
 
-        if best_rect is not None:
-            break  # found a clean spot at this distance — done
+        if best_rect is not None and effective_dist == DIST_STEPS[0]:
+            break  # found a clean spot at closest distance — no need to go further
 
     # ── PASS 2 (soft fallback): if no perfectly clean spot exists, allow
     # overlaps/crossings but penalise them heavily so we pick the least-bad option.
     if best_rect is None:
+        logging.warning(f"   ⚠️  No clean placement found for '{text[:30]}…' — using soft fallback")
         BIG_PENALTY = page_diag * 1000
         best_score = float("inf")
         for effective_dist in DIST_STEPS:
