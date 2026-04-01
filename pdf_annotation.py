@@ -577,8 +577,8 @@ def place_callout_annotation(
     best_rect: fitz.Rect = None
     best_score = float("inf")  # lower = better; 0 = perfect
 
-    # Minimum gap between neighbouring callout boxes (just enough to not touch)
-    MARGIN = font_size * 1.0
+    # Gap between neighbouring callout boxes (enough to read clearly)
+    MARGIN = font_size * 2.0
 
     # Distance steps: reach far across the page so boxes spread to open space.
     # Dense at short range, progressively sparser at long range.
@@ -712,6 +712,16 @@ def place_callout_annotation(
                 if not page_rect.contains(candidate):
                     continue
 
+                # Hard even in Pass 2: NEVER place on polygon fills
+                if forbidden_rects:
+                    if any(not (candidate & fr).is_empty for fr in forbidden_rects):
+                        continue
+
+                # Hard even in Pass 2: NEVER place on markers/shapes
+                if marker_zones:
+                    if any(not (candidate & mz).is_empty for mz in marker_zones):
+                        continue
+
                 score = effective_dist  # base: prefer short leader lines
 
                 for placed in placed_boxes:
@@ -719,12 +729,6 @@ def place_callout_annotation(
                     inter = candidate & padded
                     if not inter.is_empty:
                         score += inter.width * inter.height
-
-                if marker_zones:
-                    for mz in marker_zones:
-                        inter = candidate & mz
-                        if not inter.is_empty:
-                            score += inter.width * inter.height * 5
 
                 ccx0, ccy0, ccx1, ccy1 = candidate.x0, candidate.y0, candidate.x1, candidate.y1
                 cax = ccx0 if marker_x <= ccx0 else (ccx1 if marker_x >= ccx1 else (ccx0 + ccx1) / 2)
@@ -1105,9 +1109,13 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # page with no shape outlines interfering with the overlap check.
     if pending_callouts:
         logging.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
-        # Build marker safe zones: a padded rect around each marker/polygon anchor
-        # that text boxes should avoid covering.
-        SAFE_PAD = 8.0  # extra clearance beyond the marker radius
+        # Build marker safe zones from ALL drawn shapes (markers + polygons)
+        # so text boxes never cover any drawn annotation on the floorplan.
+        SAFE_PAD = 20.0  # generous clearance around every shape
+        for sr in shape_rects:
+            padded = sr + (-SAFE_PAD, -SAFE_PAD, SAFE_PAD, SAFE_PAD)
+            marker_zones.append(padded)
+        # Also add extra-padded zones around each callout anchor point
         for item in pending_callouts:
             mx, my, mr = item[0], item[1], item[2]
             pad = mr + SAFE_PAD
