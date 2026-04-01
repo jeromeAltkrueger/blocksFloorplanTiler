@@ -577,22 +577,26 @@ def place_callout_annotation(
     best_rect: fitz.Rect = None
     best_score = float("inf")  # lower = better; 0 = perfect
 
-    # Breathing room between neighbouring boxes (3× font for readable gap)
-    MARGIN = font_size * 3.0
+    # Minimum gap between neighbouring callout boxes (just enough to not touch)
+    MARGIN = font_size * 1.0
 
     # Distance steps: reach far across the page so boxes spread to open space.
+    # Dense at short range, progressively sparser at long range.
     page_diag = (page_rect.width ** 2 + page_rect.height ** 2) ** 0.5
-    DIST_STEPS = [
-        min_dist * m for m in (1.0, 1.5, 2.2, 3.2, 5.0, 8.0, 12.0, 18.0, 26.0, 38.0, 55.0, 80.0)
-    ]
-    # Cap so no step exceeds 45% of page diagonal (allows reaching far corners)
-    DIST_STEPS = [min(d, page_diag * 0.45) for d in DIST_STEPS]
+    DIST_MULTS = (
+        1.0, 1.3, 1.7, 2.2, 3.0, 4.0, 5.5, 7.5, 10.0, 14.0,
+        19.0, 26.0, 35.0, 48.0, 65.0, 90.0,
+    )
+    DIST_STEPS = [min_dist * m for m in DIST_MULTS]
+    # Cap so no step exceeds 50% of page diagonal (allows reaching far corners)
+    DIST_STEPS = [min(d, page_diag * 0.50) for d in DIST_STEPS]
     # Deduplicate after capping
     seen = set()
     DIST_STEPS = [d for d in DIST_STEPS if not (round(d, 1) in seen or seen.add(round(d, 1)))]
 
     # ── PASS 1: find a CLEAN placement (no overlaps, no crossings) ────────────
-    # All violations are hard-reject. Only score by leader-line length (prefer short).
+    # All violations are hard-reject.  Search ALL distances — never break early.
+    # Score balances short leader lines with clearance from existing boxes.
     for effective_dist in DIST_STEPS:
         for dx, dy in DIRS:
             if dx > 0:
@@ -660,14 +664,28 @@ def place_callout_annotation(
                        for cl_a, cl_t in committed_lines):
                     continue
 
-            # All checks passed — score by distance (prefer closer to marker)
-            dist_score = effective_dist
-            if dist_score < best_score:
-                best_score = dist_score
-                best_rect = candidate
+            # ── Score: balance short leader line vs clearance from neighbours ──
+            # Clearance = distance to the nearest placed box edge.  A position
+            # that is slightly further from the marker but surrounded by open
+            # space is preferred over one that is close but squeezed between
+            # existing boxes.
+            min_clearance = page_diag
+            for placed in placed_boxes:
+                dx_gap = max(0, placed.x0 - candidate.x1, candidate.x0 - placed.x1)
+                dy_gap = max(0, placed.y0 - candidate.y1, candidate.y0 - placed.y1)
+                gap_dist = (dx_gap ** 2 + dy_gap ** 2) ** 0.5
+                min_clearance = min(min_clearance, gap_dist)
 
-        if best_rect is not None and effective_dist == DIST_STEPS[0]:
-            break  # found a clean spot at closest distance — no need to go further
+            # Score: leader line length, penalised when squeezed near boxes.
+            # Clearance reward caps at 3× box height so distant positions don't
+            # win just because they're far from everything.
+            clearance_cap = box_height * 3.0
+            clearance_reward = min(min_clearance, clearance_cap) / clearance_cap  # 0..1
+            score = effective_dist - clearance_reward * effective_dist * 0.4
+
+            if score < best_score:
+                best_score = score
+                best_rect = candidate
 
     # ── PASS 2 (soft fallback): if no perfectly clean spot exists, allow
     # overlaps/crossings but penalise them heavily so we pick the least-bad option.
