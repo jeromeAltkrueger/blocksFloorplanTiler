@@ -791,7 +791,7 @@ def place_callout_annotation(
     # For markers: use the marker centre as before.
     if polygon_points:
         perim_pt = _closest_point_on_polygon(attach, polygon_points)
-        NUDGE = 6.0  # pt — how far inside the polygon the tip lands
+        NUDGE = 15.0  # pt — how far inside the polygon the tip lands
         cx_poly = marker_x  # marker_x/y hold the centroid for polygons
         cy_poly = marker_y
         vx, vy = cx_poly - perim_pt.x, cy_poly - perim_pt.y
@@ -821,7 +821,7 @@ def place_callout_annotation(
         fontname="hebo",
         fill_color=(1, 1, 0.667),       # light yellow (255/255/170) box background
         text_color=(0, 0, 0),            # black → controls text, box border AND leader line
-        border_width=4.0,
+        border_width=6.0,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_NONE,
     )
