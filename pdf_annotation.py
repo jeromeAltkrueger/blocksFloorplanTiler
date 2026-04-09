@@ -717,12 +717,16 @@ def place_callout_annotation(
                     if any(not (candidate & fr).is_empty for fr in forbidden_rects):
                         continue
 
-                # Hard even in Pass 2: NEVER place on markers/shapes
+                # Soft in Pass 2: heavily penalise overlap with markers/shapes
+                # but don't hard-reject (box is rendered on top, still visible)
+                marker_overlap_penalty = 0.0
                 if marker_zones:
-                    if any(not (candidate & mz).is_empty for mz in marker_zones):
-                        continue
+                    for mz in marker_zones:
+                        inter = candidate & mz
+                        if not inter.is_empty:
+                            marker_overlap_penalty += inter.width * inter.height * 10
 
-                score = effective_dist  # base: prefer short leader lines
+                score = effective_dist + marker_overlap_penalty
 
                 for placed in placed_boxes:
                     padded = placed + (-MARGIN, -MARGIN, MARGIN, MARGIN)
@@ -815,9 +819,9 @@ def place_callout_annotation(
         text,
         fontsize=font_size,
         fontname="hebo",
-        fill_color=(1, 0.85, 0),     # amber-yellow box background (richer than pure yellow on print)
-        text_color=(0.75, 0, 0),     # dark crimson red → controls text, box border AND leader line (~6:1 contrast on amber)
-        border_width=2.5,
+        fill_color=(1, 1, 0.667),       # light yellow (255/255/170) box background
+        text_color=(0, 0, 0),            # black → controls text, box border AND leader line
+        border_width=4.0,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_NONE,
     )
@@ -999,12 +1003,15 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         logging.error(f"Downloaded content is NOT a PDF ({len(pdf_bytes)} bytes, magic={pdf_bytes[:20]!r}). Returning original.")
         return pdf_bytes
 
-    # Open PDF
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    if not doc.is_pdf or doc.page_count == 0:
-        logging.error(f"fitz opened file but is_pdf={doc.is_pdf}, pages={doc.page_count}. Returning original.")
-        doc.close()
+    # Open PDF — repair pass to fix broken xrefs / orphaned objects
+    tmp_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if not tmp_doc.is_pdf or tmp_doc.page_count == 0:
+        logging.error(f"fitz opened file but is_pdf={tmp_doc.is_pdf}, pages={tmp_doc.page_count}. Returning original.")
+        tmp_doc.close()
         return pdf_bytes
+    repaired_bytes = tmp_doc.tobytes(garbage=4, deflate=True)
+    tmp_doc.close()
+    doc = fitz.open(stream=repaired_bytes, filetype="pdf")
     page = doc[0]  # First page
 
     logging.info(f"=" * 80)
@@ -1042,10 +1049,10 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     n_callouts = max(n_callouts, 1)
 
     # Font: ~13.5pt on A4, ~15pt on A3, ~19pt on A1, ~21pt on A0
-    callout_font_size = round(min(21.0, (9.0 + 3.0 * _math.log2(max(1.0, page_scale))) * 1.5), 1)
+    callout_font_size = round(min(26.0, (9.0 + 3.0 * _math.log2(max(1.0, page_scale))) * 1.8), 1)
 
-    # Box width cap: 15% of page width
-    callout_max_box_width = round(pdf_w * 0.15)
+    # Box width cap: 18% of page width
+    callout_max_box_width = round(pdf_w * 0.18)
 
     logging.info(f"  Dynamic callout: font={callout_font_size}pt"
                  f"  page_scale={page_scale:.2f}  n_callouts={n_callouts}"
@@ -1149,7 +1156,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # Save to bytes — fallback to original if internal state is corrupted
     output = io.BytesIO()
     try:
-        doc.save(output)
+        doc.save(output, garbage=3, deflate=True)
         doc.close()
     except (AssertionError, Exception) as save_err:
         logging.error(f"⚠️  doc.save() failed ({save_err}), returning original PDF unmodified")
