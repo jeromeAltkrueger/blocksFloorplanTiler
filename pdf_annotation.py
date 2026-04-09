@@ -1003,15 +1003,12 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         logging.error(f"Downloaded content is NOT a PDF ({len(pdf_bytes)} bytes, magic={pdf_bytes[:20]!r}). Returning original.")
         return pdf_bytes
 
-    # Open PDF — repair pass to fix broken xrefs / orphaned objects
-    tmp_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    if not tmp_doc.is_pdf or tmp_doc.page_count == 0:
-        logging.error(f"fitz opened file but is_pdf={tmp_doc.is_pdf}, pages={tmp_doc.page_count}. Returning original.")
-        tmp_doc.close()
+    # Open PDF
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if not doc.is_pdf or doc.page_count == 0:
+        logging.error(f"fitz opened file but is_pdf={doc.is_pdf}, pages={doc.page_count}. Returning original.")
+        doc.close()
         return pdf_bytes
-    repaired_bytes = tmp_doc.tobytes(garbage=4, deflate=True)
-    tmp_doc.close()
-    doc = fitz.open(stream=repaired_bytes, filetype="pdf")
     page = doc[0]  # First page
 
     logging.info(f"=" * 80)
@@ -1153,20 +1150,28 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
 
-    # Save to bytes — fallback to original if internal state is corrupted
+    # Save to bytes — try clean save first, then incremental for broken PDFs
     output = io.BytesIO()
     try:
         doc.save(output, garbage=3, deflate=True)
         doc.close()
-    except (AssertionError, Exception) as save_err:
-        logging.error(f"⚠️  doc.save() failed ({save_err}), returning original PDF unmodified")
+        return output.getvalue()
+    except Exception as save_err:
+        logging.warning(f"⚠️  Clean save failed ({save_err}), trying incremental save...")
+
+    # Incremental save: only appends new/changed objects — avoids broken xrefs
+    try:
+        result = doc.tobytes(incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+        doc.close()
+        logging.info("✅ Incremental save succeeded")
+        return result
+    except Exception as inc_err:
+        logging.error(f"⚠️  Incremental save also failed ({inc_err}), returning original PDF unmodified")
         try:
             doc.close()
         except Exception:
             pass
         return pdf_bytes
-
-    return output.getvalue()
 
 
 # ==========================================
