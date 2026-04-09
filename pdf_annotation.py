@@ -1152,26 +1152,30 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
 
     # Save to bytes — try clean save first, then incremental for broken PDFs
     output = io.BytesIO()
+    # Incremental save first (safe — only appends, never touches broken xrefs)
+    incremental_bytes = None
+    try:
+        incremental_bytes = doc.tobytes(incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+        logging.info("✅ Incremental save succeeded")
+    except Exception as inc_err:
+        logging.warning(f"⚠️  Incremental save failed ({inc_err})")
+
+    # Try clean save (smaller output, removes orphans) — only if doc state is still good
     try:
         doc.save(output, garbage=3, deflate=True)
         doc.close()
+        logging.info("✅ Clean save succeeded")
         return output.getvalue()
     except Exception as save_err:
-        logging.warning(f"⚠️  Clean save failed ({save_err}), trying incremental save...")
+        logging.warning(f"⚠️  Clean save failed ({save_err})")
 
-    # Incremental save: only appends new/changed objects — avoids broken xrefs
-    try:
-        result = doc.tobytes(incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
-        doc.close()
-        logging.info("✅ Incremental save succeeded")
-        return result
-    except Exception as inc_err:
-        logging.error(f"⚠️  Incremental save also failed ({inc_err}), returning original PDF unmodified")
-        try:
-            doc.close()
-        except Exception:
-            pass
-        return pdf_bytes
+    doc.close()
+
+    if incremental_bytes:
+        return incremental_bytes
+
+    logging.error("⚠️  Both save methods failed, returning original PDF unmodified")
+    return pdf_bytes
 
 
 # ==========================================
