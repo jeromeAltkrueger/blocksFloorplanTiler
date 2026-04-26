@@ -10,6 +10,8 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
+logger = logging.getLogger("pdf_annotation")
+
 import azure.functions as func
 import fitz  # PyMuPDF for PDF annotation
 import httpx
@@ -102,13 +104,13 @@ def detect_trim_offset(page: fitz.Page, metadata: Dict[str, Any]) -> Tuple[float
 
     # Check if trimming occurred (allow 1px tolerance for rounding)
     if abs(pretrim_w - img_w) <= 1 and abs(pretrim_h - img_h) <= 1:
-        logging.info("No whitespace trimming detected — using direct formula")
+        logger.info("No whitespace trimming detected — using direct formula")
         return (0.0, 0.0)
 
-    logging.info(f"Whitespace trimming detected!")
-    logging.info(f"  Pre-trim:  {pretrim_w:.0f} x {pretrim_h:.0f} px")
-    logging.info(f"  Post-trim: {img_w} x {img_h} px")
-    logging.info(f"  Trimmed:   {pretrim_w - img_w:.0f} x {pretrim_h - img_h:.0f} px")
+    logger.info(f"Whitespace trimming detected!")
+    logger.info(f"  Pre-trim:  {pretrim_w:.0f} x {pretrim_h:.0f} px")
+    logger.info(f"  Post-trim: {img_w} x {img_h} px")
+    logger.info(f"  Trimmed:   {pretrim_w - img_w:.0f} x {pretrim_h - img_h:.0f} px")
 
     # Re-render at low resolution to detect content bbox
     # Use scale 2.0 (144 DPI) — fast and accurate enough for bbox detection
@@ -125,7 +127,7 @@ def detect_trim_offset(page: fitz.Page, metadata: Dict[str, Any]) -> Tuple[float
     pil_img.close()
 
     if not bbox:
-        logging.warning("Could not detect content bbox — using (0, 0) offset")
+        logger.warning("Could not detect content bbox — using (0, 0) offset")
         return (0.0, 0.0)
 
     # bbox is (left, top, right, bottom) in detect_scale pixels
@@ -140,15 +142,15 @@ def detect_trim_offset(page: fitz.Page, metadata: Dict[str, Any]) -> Tuple[float
     trim_left = left_detect * pdf_scale / detect_scale
     trim_top = top_detect * pdf_scale / detect_scale
 
-    logging.info(f"  Content bbox at {detect_scale}x: left={bbox[0]}, top={bbox[1]}")
-    logging.info(f"  Trim offset (at pdf_scale): left={trim_left:.1f}, top={trim_top:.1f} px")
+    logger.info(f"  Content bbox at {detect_scale}x: left={bbox[0]}, top={bbox[1]}")
+    logger.info(f"  Trim offset (at pdf_scale): left={trim_left:.1f}, top={trim_top:.1f} px")
 
     # Verify: post-trim dimensions should roughly match metadata
     right_detect = min(pix.width, bbox[2] + padding_at_detect)
     bottom_detect = min(pix.height, bbox[3] + padding_at_detect)
     detected_w = (right_detect - left_detect) * pdf_scale / detect_scale
     detected_h = (bottom_detect - top_detect) * pdf_scale / detect_scale
-    logging.info(f"  Detected content size: {detected_w:.0f} x {detected_h:.0f} px (metadata: {img_w} x {img_h})")
+    logger.info(f"  Detected content size: {detected_w:.0f} x {detected_h:.0f} px (metadata: {img_w} x {img_h})")
 
     return (trim_left, trim_top)
 
@@ -202,15 +204,15 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
     # GeoJSON polygons: coordinates[0] is outer ring
     outer_ring = coordinates[0]
 
-    logging.info(f"Drawing polygon with {len(outer_ring)} points")
+    logger.info(f"Drawing polygon with {len(outer_ring)} points")
 
     # Convert coords to PDF coordinates
     pdf_points = []
     for point in outer_ring:
         x, y = point[0], point[1]
-        logging.info(f"  Leaflet: [{x}, {y}]")
+        logger.info(f"  Leaflet: [{x}, {y}]")
         x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
-        logging.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
+        logger.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
         pdf_points.append(fitz.Point(x_pdf, y_pdf))
 
     if len(pdf_points) >= 3:
@@ -227,7 +229,7 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
             closePath=True
         )
         shape.commit()
-        logging.info(f"✅ Polygon drawn with {len(pdf_points)} points")
+        logger.info(f"✅ Polygon drawn with {len(pdf_points)} points")
 
         # Register bounding box so callout placement avoids the polygon fill.
         if shape_rects is not None:
@@ -251,9 +253,9 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                 for p in pdf_points
             )
             pending_callouts.append((cx, cy, circumradius, overlay, pdf_points))
-            logging.info(f"   Polygon overlay queued: centroid=({cx:.1f},{cy:.1f}), circumradius={circumradius:.1f}")
+            logger.info(f"   Polygon overlay queued: centroid=({cx:.1f},{cy:.1f}), circumradius={circumradius:.1f}")
     else:
-        logging.warning(f"⚠️  Not enough points: {len(pdf_points)}")
+        logger.warning(f"⚠️  Not enough points: {len(pdf_points)}")
 
 
 def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
@@ -281,7 +283,7 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
         pending_callouts: Mutable list; (x_pdf, y_pdf, radius, text) appended when overlay present
     """
     x, y = coordinates[0], coordinates[1]
-    logging.info(f"Drawing marker at [{x}, {y}]")
+    logger.info(f"Drawing marker at [{x}, {y}]")
 
     # Convert to PDF coordinates
     x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
@@ -297,7 +299,7 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     circ_annot.set_colors(stroke=stroke_color, fill=config["fill_color"])
     circ_annot.set_border(width=config.get("stroke_width", 2))
     circ_annot.update(opacity=config["fill_opacity"])
-    logging.info(f"✅ Marker circle annotation placed at ({x_pdf:.1f}, {y_pdf:.1f})")
+    logger.info(f"✅ Marker circle annotation placed at ({x_pdf:.1f}, {y_pdf:.1f})")
     if shape_rects is not None:
         shape_rects.append(circ_rect)
 
@@ -306,13 +308,13 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     if pending_callouts is not None:
         if label:
             pending_callouts.append((x_pdf, y_pdf, radius, label))
-            logging.info(f"   Label queued for callout: '{label}'")
+            logger.info(f"   Label queued for callout: '{label}'")
         if overlay:
             pending_callouts.append((x_pdf, y_pdf, radius, overlay))
-            logging.info(f"   Overlay queued for callout: '{overlay}'")
+            logger.info(f"   Overlay queued for callout: '{overlay}'")
     else:
         if label or overlay:
-            logging.warning("   label/overlay present but no pending_callouts list provided — skipped")
+            logger.warning("   label/overlay present but no pending_callouts list provided — skipped")
 
 
 def draw_square_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
@@ -518,7 +520,7 @@ def place_callout_annotation(
     box_width = round(box_width)
 
     # ── Sizing diagnostics (inputs) ───────────────────────────────────────────
-    logging.info(
+    logger.info(
         f"   [sizing-in]  text='{text}' | chars={len(text)}"
         f" | page={page_rect.width:.0f}x{page_rect.height:.0f}pt"
         f" | radius={marker_radius:.1f}pt"
@@ -551,7 +553,7 @@ def place_callout_annotation(
     min_dist = marker_radius + gap
 
     # ── Sizing diagnostics (derived) ──────────────────────────────────────────
-    logging.info(
+    logger.info(
         f"   [sizing-out] chars_per_line={chars_per_line} | n_lines={n_lines}"
         f" | box={box_width:.0f}x{box_height:.1f}pt"
         f" | min_dist={min_dist:.1f}pt (radius {marker_radius:.1f} + gap {gap})"
@@ -690,7 +692,7 @@ def place_callout_annotation(
     # ── PASS 2 (soft fallback): if no perfectly clean spot exists, allow
     # overlaps/crossings but penalise them heavily so we pick the least-bad option.
     if best_rect is None:
-        logging.warning(f"   ⚠️  No clean placement found for '{text[:30]}…' — using soft fallback")
+        logger.warning(f"   ⚠️  No clean placement found for '{text[:30]}…' — using soft fallback")
         BIG_PENALTY = page_diag * 1000
         best_score = float("inf")
         for effective_dist in DIST_STEPS:
@@ -827,7 +829,7 @@ def place_callout_annotation(
     )
 
     placed_boxes.append(best_rect)
-    logging.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
+    logger.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
 
     # Return the leader-line endpoints so the caller can draw them as Line
     # annotations AFTER all FreeText annotations are placed.  PDF rendering is
@@ -966,7 +968,7 @@ def _diag_callout_variants_RETIRED(page: fitz.Page) -> None:
         shape.finish(color=(0, 0, 0), fill=(1, 1, 0), width=0.5)
 
     shape.commit()
-    logging.info(f"🧪 DIAG: rendered {len(VARIANTS)} callout variants at top-left")
+    logger.info(f"🧪 DIAG: rendered {len(VARIANTS)} callout variants at top-left")
 
 
 async def download_file(url: str) -> bytes:
@@ -999,60 +1001,60 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         Annotated PDF as bytes (returns original bytes unmodified on failure)
     """
     # ── PDF header / size validation ─────────────────────────────────────────
-    logging.info(f"PDF bytes received: {len(pdf_bytes):,} bytes")
+    logger.info(f"PDF bytes received: {len(pdf_bytes):,} bytes")
     if not pdf_bytes:
-        logging.error("PDF bytes are empty. Returning original.")
+        logger.error("PDF bytes are empty. Returning original.")
         return pdf_bytes
     magic = pdf_bytes[:8]
-    logging.info(f"PDF magic bytes: {magic!r}")
+    logger.info(f"PDF magic bytes: {magic!r}")
     if magic[:5] != b"%PDF-":
-        logging.error(f"Downloaded content is NOT a PDF ({len(pdf_bytes):,} bytes, magic={pdf_bytes[:20]!r}). Returning original.")
+        logger.error(f"Downloaded content is NOT a PDF ({len(pdf_bytes):,} bytes, magic={pdf_bytes[:20]!r}). Returning original.")
         return pdf_bytes
     # Log PDF version string (e.g. b'%PDF-1.7')
     version_line = pdf_bytes[:20].split(b"\n")[0].strip()
-    logging.info(f"PDF version header: {version_line!r}")
+    logger.info(f"PDF version header: {version_line!r}")
 
     # ── Open PDF ──────────────────────────────────────────────────────────────
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     except Exception as open_err:
-        logging.error(f"fitz.open() raised an exception: {open_err!r} — PDF may be corrupt. Returning original.", exc_info=True)
+        logger.error(f"fitz.open() raised an exception: {open_err!r} — PDF may be corrupt. Returning original.", exc_info=True)
         return pdf_bytes
 
-    logging.info(f"fitz.open() succeeded")
-    logging.info(f"  is_pdf       : {doc.is_pdf}")
-    logging.info(f"  page_count   : {doc.page_count}")
-    logging.info(f"  needs_pass   : {doc.needs_pass}")
-    logging.info(f"  is_encrypted : {doc.is_encrypted}")
-    logging.info(f"  is_repaired  : {doc.is_repaired}")
+    logger.info(f"fitz.open() succeeded")
+    logger.info(f"  is_pdf       : {doc.is_pdf}")
+    logger.info(f"  page_count   : {doc.page_count}")
+    logger.info(f"  needs_pass   : {doc.needs_pass}")
+    logger.info(f"  is_encrypted : {doc.is_encrypted}")
+    logger.info(f"  is_repaired  : {doc.is_repaired}")
     try:
         pdf_meta = doc.metadata
-        logging.info(
+        logger.info(
             f"  metadata     : producer={pdf_meta.get('producer')!r}  "
             f"creator={pdf_meta.get('creator')!r}  "
             f"format={pdf_meta.get('format')!r}"
         )
     except Exception:
-        logging.warning("  metadata     : (could not read)")
+        logger.warning("  metadata     : (could not read)")
 
     if not doc.is_pdf or doc.page_count == 0:
-        logging.error(f"fitz opened file but is_pdf={doc.is_pdf}, pages={doc.page_count}. Returning original.")
+        logger.error(f"fitz opened file but is_pdf={doc.is_pdf}, pages={doc.page_count}. Returning original.")
         doc.close()
         return pdf_bytes
 
     page = doc[0]  # First page
-    logging.info(f"Page 0 info:")
-    logging.info(f"  mediabox     : {page.mediabox}")
-    logging.info(f"  cropbox      : {page.cropbox}")
-    logging.info(f"  rect         : {page.rect}  ({page.rect.width:.1f} x {page.rect.height:.1f} pt)")
-    logging.info(f"  rotation     : {page.rotation}°")
+    logger.info(f"Page 0 info:")
+    logger.info(f"  mediabox     : {page.mediabox}")
+    logger.info(f"  cropbox      : {page.cropbox}")
+    logger.info(f"  rect         : {page.rect}  ({page.rect.width:.1f} x {page.rect.height:.1f} pt)")
+    logger.info(f"  rotation     : {page.rotation}°")
     existing_annots = list(page.annots())
-    logging.info(f"  existing annots: {len(existing_annots)} " +
+    logger.info(f"  existing annots: {len(existing_annots)} " +
                  ("(" + ", ".join(a.type[1] for a in existing_annots) + ")" if existing_annots else "(none)"))
 
-    logging.info(f"=" * 80)
-    logging.info(f"PDF ANNOTATION")
-    logging.info(f"=" * 80)
+    logger.info(f"=" * 80)
+    logger.info(f"PDF ANNOTATION")
+    logger.info(f"=" * 80)
 
     # ── Floorplan specs ───────────────────────────────────────────────────────
     pdf_w = page.rect.width
@@ -1063,11 +1065,11 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     px_per_pt_x = img_w / pdf_w
     px_per_pt_y = img_h / pdf_h
 
-    logging.info(f"  PDF size   : {pdf_w:.1f} x {pdf_h:.1f} pt  ({pdf_w/pts_per_mm:.1f} x {pdf_h/pts_per_mm:.1f} mm)")
-    logging.info(f"  Image size : {img_w} x {img_h} px")
-    logging.info(f"  Px/pt ratio: {px_per_pt_x:.3f} x (horiz)  {px_per_pt_y:.3f} y (vert)")
-    logging.info(f"  1 pt = {1/px_per_pt_x:.2f} px (horiz)  |  1 px = {px_per_pt_x:.3f} pt")
-    logging.info(f"  Default callout: font=9pt ({9/pts_per_mm:.1f}mm)  box=130x? pt ({130/pts_per_mm:.1f}mm wide)")
+    logger.info(f"  PDF size   : {pdf_w:.1f} x {pdf_h:.1f} pt  ({pdf_w/pts_per_mm:.1f} x {pdf_h/pts_per_mm:.1f} mm)")
+    logger.info(f"  Image size : {img_w} x {img_h} px")
+    logger.info(f"  Px/pt ratio: {px_per_pt_x:.3f} x (horiz)  {px_per_pt_y:.3f} y (vert)")
+    logger.info(f"  1 pt = {1/px_per_pt_x:.2f} px (horiz)  |  1 px = {px_per_pt_x:.3f} pt")
+    logger.info(f"  Default callout: font=9pt ({9/pts_per_mm:.1f}mm)  box=130x? pt ({130/pts_per_mm:.1f}mm wide)")
 
     # ── Dynamic callout sizing from page dimensions + annotation density ──────
     # Font should be small & fixed-ish — annotations are read at arm's length
@@ -1090,7 +1092,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # Box width cap: 18% of page width
     callout_max_box_width = round(pdf_w * 0.18)
 
-    logging.info(f"  Dynamic callout: font={callout_font_size}pt"
+    logger.info(f"  Dynamic callout: font={callout_font_size}pt"
                  f"  page_scale={page_scale:.2f}  n_callouts={n_callouts}"
                  f"  max_box_w={callout_max_box_width}pt ({callout_max_box_width/pdf_w*100:.0f}%)")
 
@@ -1099,15 +1101,15 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     for obj in objects:
         geo_type = obj.get("geometry", {}).get("type", "unknown")
         type_counts[geo_type] = type_counts.get(geo_type, 0) + 1
-    logging.info(f"  Objects    : {len(objects)} total — " + ", ".join(f"{v}x {k}" for k, v in type_counts.items()))
-    logging.info(f"=" * 80)
+    logger.info(f"  Objects    : {len(objects)} total — " + ", ".join(f"{v}x {k}" for k, v in type_counts.items()))
+    logger.info(f"=" * 80)
 
     # ── Dump all incoming objects for debugging ───────────────────────────────
-    logging.info("INCOMING OBJECTS DUMP:")
+    logger.info("INCOMING OBJECTS DUMP:")
     for _di, _obj in enumerate(objects):
         _props = _obj.get("properties", {})
         _geom  = _obj.get("geometry", {})
-        logging.info(
+        logger.info(
             f"  [{_di+1}/{len(objects)}] geo={_geom.get('type')} "
             f"prop_type={_props.get('type')} "
             f"overlay={_props.get('overlay') or _obj.get('overlay')!r} "
@@ -1118,12 +1120,12 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             f"fontSize={_props.get('fontSize')!r} "
             f"coords={str(_geom.get('coordinates', []))[:80]}"
         )
-    logging.info(f"=" * 80)
+    logger.info(f"=" * 80)
 
     # Detect whitespace trim offset (needed when PDF had margins that were cropped)
     trim_offset = detect_trim_offset(page, metadata)
-    logging.info(f"Trim offset: left={trim_offset[0]:.1f}, top={trim_offset[1]:.1f} px")
-    logging.info(f"=" * 80)
+    logger.info(f"Trim offset: left={trim_offset[0]:.1f}, top={trim_offset[1]:.1f} px")
+    logger.info(f"=" * 80)
 
     # Process each object
     # pending_callouts collects (x_pdf, y_pdf, radius, text) for markers with
@@ -1136,19 +1138,19 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     objects_drawn = 0
     for i, obj in enumerate(objects):
         try:
-            logging.info(f"\n--- Object {i + 1}/{len(objects)} ---")
+            logger.info(f"\n--- Object {i + 1}/{len(objects)} ---")
             properties = obj.get("properties", {})
             obj_type = properties.get("type", "unknown")
             geometry = obj.get("geometry", {})
             geo_type = geometry.get("type")
             coordinates = geometry.get("coordinates", [])
 
-            logging.info(f"Type: {obj_type}, Geometry: {geo_type}, Properties: {properties}")
+            logger.info(f"Type: {obj_type}, Geometry: {geo_type}, Properties: {properties}")
 
             if geo_type == "Polygon":
                 config = ANNOTATION_CONFIG["polygon"].copy()
                 overlay = obj.get("overlay") or properties.get("overlay")
-                logging.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}, overlay={overlay!r}")
+                logger.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}, overlay={overlay!r}")
                 draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects, polygon_rects)
                 objects_drawn += 1
 
@@ -1156,10 +1158,10 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                 # Text field: render as a FreeText callout/label at position
                 text_content = (properties.get("text") or properties.get("content")
                                 or properties.get("label") or properties.get("overlay") or "")
-                logging.info(f"   TEXT FIELD: content={text_content!r}, coords={coordinates}")
+                logger.info(f"   TEXT FIELD: content={text_content!r}, coords={coordinates}")
                 if text_content:
                     x_pdf, y_pdf = transform_coords(coordinates, metadata, trim_offset)
-                    logging.info(f"   TEXT FIELD -> PDF coords: ({x_pdf:.2f}, {y_pdf:.2f})")
+                    logger.info(f"   TEXT FIELD -> PDF coords: ({x_pdf:.2f}, {y_pdf:.2f})")
                     text_config = ANNOTATION_CONFIG["text"].copy()
                     font_size_override = properties.get("fontSize")
                     if font_size_override:
@@ -1168,34 +1170,34 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                         except (TypeError, ValueError):
                             pass
                     draw_text_on_pdf(page, [x_pdf, y_pdf], text_content, text_config)
-                    logging.info(f"✅ Text field drawn: {text_content!r} at PDF ({x_pdf:.1f}, {y_pdf:.1f})")
+                    logger.info(f"✅ Text field drawn: {text_content!r} at PDF ({x_pdf:.1f}, {y_pdf:.1f})")
                     objects_drawn += 1
                 else:
-                    logging.warning(f"⚠️  Text field has no content — properties={properties}")
+                    logger.warning(f"⚠️  Text field has no content — properties={properties}")
 
             elif geo_type == "Point":
                 config = ANNOTATION_CONFIG["marker"].copy()
                 label = properties.get("content") or properties.get("label")
                 overlay = obj.get("overlay") or properties.get("overlay")
-                logging.info(f"   MARKER: label={label!r}, overlay={overlay!r}, coords={coordinates}")
+                logger.info(f"   MARKER: label={label!r}, overlay={overlay!r}, coords={coordinates}")
                 draw_marker_on_pdf(page, coordinates, metadata, config, label, overlay, trim_offset, pending_callouts, shape_rects)
                 objects_drawn += 1
 
             else:
-                logging.warning(
+                logger.warning(
                     f"⚠️  Unhandled object: geo_type={geo_type!r}, obj_type={obj_type!r}, "
                     f"properties={properties}, coords={str(coordinates)[:80]}"
                 )
 
         except Exception as e:
-            logging.error(f"❌ Error drawing object {i + 1}: {str(e)}", exc_info=True)
+            logger.error(f"❌ Error drawing object {i + 1}: {str(e)}", exc_info=True)
             continue
 
     # ── Place deferred Callout annotations ──────────────────────────────────
     # Done after all burned-in shapes so the placement algorithm sees a clean
     # page with no shape outlines interfering with the overlap check.
     if pending_callouts:
-        logging.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
+        logger.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
         # Build marker safe zones from ALL drawn shapes (markers + polygons)
         # so text boxes never cover any drawn annotation on the floorplan.
         SAFE_PAD = 20.0  # generous clearance around every shape
@@ -1227,44 +1229,44 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                 if result:
                     committed_lines.append(result)
             except Exception as e:
-                logging.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
+                logger.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
 
-    logging.info(f"\n{'=' * 80}")
-    logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
-    logging.info(f"{'=' * 80}\n")
+    logger.info(f"\n{'=' * 80}")
+    logger.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
+    logger.info(f"{'=' * 80}\n")
 
     # ── Save annotated PDF ────────────────────────────────────────────────────
-    logging.info("Saving annotated PDF...")
-    logging.info(f"  Input size      : {len(pdf_bytes):,} bytes")
+    logger.info("Saving annotated PDF...")
+    logger.info(f"  Input size      : {len(pdf_bytes):,} bytes")
     output = io.BytesIO()
 
     # Incremental save first (safe — only appends, never touches broken xrefs)
     incremental_bytes = None
     try:
         incremental_bytes = doc.tobytes(incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
-        logging.info(f"✅ Incremental save succeeded: {len(incremental_bytes):,} bytes "
+        logger.info(f"✅ Incremental save succeeded: {len(incremental_bytes):,} bytes "
                      f"(+{len(incremental_bytes)-len(pdf_bytes):+,} bytes vs input)")
     except Exception as inc_err:
-        logging.warning(f"⚠️  Incremental save failed: {inc_err!r}")
+        logger.warning(f"⚠️  Incremental save failed: {inc_err!r}")
 
     # Try clean save (smaller output, removes orphans)
     try:
         doc.save(output, garbage=3, deflate=True)
         clean_bytes = output.getvalue()
         doc.close()
-        logging.info(f"✅ Clean save succeeded: {len(clean_bytes):,} bytes "
+        logger.info(f"✅ Clean save succeeded: {len(clean_bytes):,} bytes "
                      f"(+{len(clean_bytes)-len(pdf_bytes):+,} bytes vs input)")
         return clean_bytes
     except Exception as save_err:
-        logging.warning(f"⚠️  Clean save failed: {save_err!r}")
+        logger.warning(f"⚠️  Clean save failed: {save_err!r}")
 
     doc.close()
 
     if incremental_bytes:
-        logging.info("Using incremental save as fallback.")
+        logger.info("Using incremental save as fallback.")
         return incremental_bytes
 
-    logging.error("⚠️  Both save methods failed, returning original PDF unmodified")
+    logger.error("⚠️  Both save methods failed, returning original PDF unmodified")
     return pdf_bytes
 
 
@@ -1347,29 +1349,29 @@ def register_routes(app: func.FunctionApp):
                 base_dir = metadata_url.rsplit("/", 1)[0]  # strip "metadata.json"
                 file_id = base_dir.rsplit("/", 1)[-1]       # last path segment = file_id
                 derived_pdf_url = f"{base_dir}/{file_id}.pdf"
-                logging.info(f"⚠️  file_url is not a PDF ({file_url}), deriving PDF URL: {derived_pdf_url}")
+                logger.info(f"⚠️  file_url is not a PDF ({file_url}), deriving PDF URL: {derived_pdf_url}")
                 file_url = derived_pdf_url
 
-            logging.info(f"📝 Starting PDF annotation")
-            logging.info(f"   PDF URL: {file_url}")
-            logging.info(f"   Metadata URL: {metadata_url}")
-            logging.info(f"   Objects to draw: {len(objects)}")
+            logger.info(f"📝 Starting PDF annotation")
+            logger.info(f"   PDF URL: {file_url}")
+            logger.info(f"   Metadata URL: {metadata_url}")
+            logger.info(f"   Objects to draw: {len(objects)}")
 
             # Download metadata
-            logging.info("⬇️ Downloading metadata...")
+            logger.info("⬇️ Downloading metadata...")
             metadata_bytes = await download_file(metadata_url)
             metadata = json.loads(metadata_bytes.decode('utf-8'))
-            logging.info(f"✅ Metadata loaded: {metadata.get('floorplan_id')}")
+            logger.info(f"✅ Metadata loaded: {metadata.get('floorplan_id')}")
 
             # Download PDF
-            logging.info("⬇️ Downloading PDF...")
+            logger.info("⬇️ Downloading PDF...")
             pdf_bytes = await download_file(file_url)
-            logging.info(f"✅ PDF downloaded: {len(pdf_bytes)} bytes")
+            logger.info(f"✅ PDF downloaded: {len(pdf_bytes)} bytes")
 
             # Annotate PDF
-            logging.info("🎨 Annotating PDF...")
+            logger.info("🎨 Annotating PDF...")
             annotated_pdf_bytes = annotate_pdf(pdf_bytes, objects, metadata)
-            logging.info(f"✅ PDF annotated: {len(annotated_pdf_bytes)} bytes")
+            logger.info(f"✅ PDF annotated: {len(annotated_pdf_bytes)} bytes")
 
             # Generate filename with timestamp
             timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -1387,7 +1389,7 @@ def register_routes(app: func.FunctionApp):
                     mimetype="application/json"
                 )
 
-            logging.info("☁️ Uploading to Azure Blob Storage...")
+            logger.info("☁️ Uploading to Azure Blob Storage...")
             blob_service = BlobServiceClient.from_connection_string(connection_string)
 
             # Upload to 'annotated-pdfs' container
@@ -1398,7 +1400,7 @@ def register_routes(app: func.FunctionApp):
             except:
                 # Create container if it doesn't exist
                 container_client = blob_service.create_container(container_name, public_access="blob")
-                logging.info(f"Created container: {container_name}")
+                logger.info(f"Created container: {container_name}")
 
             # Upload the annotated PDF
             blob_client = blob_service.get_blob_client(container_name, annotated_filename)
@@ -1411,8 +1413,8 @@ def register_routes(app: func.FunctionApp):
             # Generate the public URL
             annotated_pdf_url = f"https://blocksplayground.blob.core.windows.net/{container_name}/{annotated_filename}"
 
-            logging.info(f"✅ Upload complete!")
-            logging.info(f"   URL: {annotated_pdf_url}")
+            logger.info(f"✅ Upload complete!")
+            logger.info(f"   URL: {annotated_pdf_url}")
 
             # Return success response
             return func.HttpResponse(
@@ -1431,7 +1433,7 @@ def register_routes(app: func.FunctionApp):
             )
 
         except httpx.HTTPError as e:
-            logging.error(f"❌ Download error: {str(e)}")
+            logger.error(f"❌ Download error: {str(e)}")
             return func.HttpResponse(
                 json.dumps({
                     "success": False,
@@ -1442,7 +1444,7 @@ def register_routes(app: func.FunctionApp):
             )
 
         except Exception as e:
-            logging.error(f"❌ Error annotating PDF: {str(e)}", exc_info=True)
+            logger.error(f"❌ Error annotating PDF: {str(e)}", exc_info=True)
             return func.HttpResponse(
                 json.dumps({
                     "success": False,
