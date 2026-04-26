@@ -807,37 +807,26 @@ def place_callout_annotation(
     else:
         tip = fitz.Point(marker_x, marker_y)
 
-    # ── Add the native PDF Callout FreeText annotation ────────────────────────
-    # Requires PyMuPDF >= 1.25.3 (FreeTextCallout subtype added in that version)
-    #
-    # Confirmed by diagnostic grid (V04): text_color in the constructor controls
-    # the /DA appearance stream, which PyMuPDF uses for text, box border AND the
-    # callout arrow line — all three share the same color.  border_color and
-    # set_colors() both raise ValueError for FreeText in this PyMuPDF build.
-    # xref_set_key("C") + update() changes the BOX FILL, not the line color.
-    # Conclusion: text_color is the single lever for arrow + border color.
+    # ── Add the FreeText box (NO embedded callout) ───────────────────────────
+    # The leader line is drawn AFTER all boxes are placed, as a separate
+    # add_line_annot() call.  This guarantees lines render on top of every
+    # box fill in the resulting PDF / pixmap (annotations render in /Annots
+    # order, so later annotations paint over earlier ones).
     annot = page.add_freetext_annot(
         best_rect,
         text,
         fontsize=font_size,
         fontname="hebo",
-        fill_color=(1, 1, 0.667),       # light yellow (255/255/170) box background
-        text_color=(0, 0, 0),            # black → controls text, box border AND leader line
-        border_width=6.0,
-        callout=[tip, attach],
-        line_end=fitz.PDF_ANNOT_LE_NONE,
+        fill_color=(1, 1, 0.667),       # light yellow box background
+        text_color=(0, 0, 0),            # black text + border
+        border_width=1.5,
     )
 
     placed_boxes.append(best_rect)
     logger.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
 
     # Return the leader-line endpoints so the caller can draw them as Line
-    # annotations AFTER all FreeText annotations are placed.  PDF rendering is
-    # always: content-stream first, then annotations in /Annots order.  Drawing
-    # lines here (inside the function) — whether as content-stream shapes or as
-    # annotations — would let later FreeText boxes paint over them.  Only by
-    # adding Line annotations AFTER every FreeText annotation are the lines
-    # guaranteed to render on top of all boxes in get_pixmap().
+    # annotations AFTER all FreeText annotations are placed.
     return (attach, tip)
 
 
@@ -1196,16 +1185,46 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # ── Place deferred Callout annotations ──────────────────────────────────
     # Done after all burned-in shapes so the placement algorithm sees a clean
     # page with no shape outlines interfering with the overlap check.
+    leader_lines: List[Tuple[fitz.Point, fitz.Point]] = []  # (attach, tip) pairs to render as Line annots
     if pending_callouts:
-        logger.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
+        # ── Cluster marker callouts (4-tuple) with IDENTICAL text ─────────
+        # Polygon callouts (5-tuple) stay individual — they need perimeter
+        # snapping which only makes sense per-polygon.
+        polygon_callouts: List = []
+        clusters: List[Tuple[List[Tuple[float, float, float]], str]] = []
+        text_to_cluster: Dict[str, int] = {}
+        for item in pending_callouts:
+            if len(item) > 4:
+                polygon_callouts.append(item)
+                continue
+            mx, my, mr, txt = item
+            if txt in text_to_cluster:
+                clusters[text_to_cluster[txt]][0].append((mx, my, mr))
+            else:
+                text_to_cluster[txt] = len(clusters)
+                clusters.append(([(mx, my, mr)], txt))
+
+        n_marker_callouts = sum(len(c[0]) for c in clusters)
+        logger.info(
+            f"\nCallout clustering: {n_marker_callouts} marker callout(s) → "
+            f"{len(clusters)} unique-text group(s); {len(polygon_callouts)} polygon callout(s)"
+        )
+        for ci, (markers, txt) in enumerate(clusters):
+            if len(markers) > 1:
+                logger.info(f"  cluster {ci+1}: {len(markers)}× '{txt[:50]}'")
+
         # Build marker safe zones from ALL drawn shapes (markers + polygons)
         # so text boxes never cover any drawn annotation on the floorplan.
         SAFE_PAD = 20.0  # generous clearance around every shape
         for sr in shape_rects:
             padded = sr + (-SAFE_PAD, -SAFE_PAD, SAFE_PAD, SAFE_PAD)
             marker_zones.append(padded)
-        # Also add extra-padded zones around each callout anchor point
-        for item in pending_callouts:
+        # Also add extra-padded zones around each marker anchor point
+        for markers, _ in clusters:
+            for mx, my, mr in markers:
+                pad = mr + SAFE_PAD
+                marker_zones.append(fitz.Rect(mx - pad, my - pad, mx + pad, my + pad))
+        for item in polygon_callouts:
             mx, my, mr = item[0], item[1], item[2]
             pad = mr + SAFE_PAD
             marker_zones.append(fitz.Rect(mx - pad, my - pad, mx + pad, my + pad))
@@ -1213,9 +1232,53 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         # Seed with shape bounding boxes so callouts won't overlap fills/circles.
         placed_boxes: List[fitz.Rect] = list(shape_rects)
         committed_lines: List[Tuple[fitz.Point, fitz.Point]] = []
-        for item in pending_callouts:
+
+        # ── Place clustered marker callouts ────────────────────────────────
+        for markers, txt in clusters:
+            # Compute centroid of all markers in the cluster
+            cx = sum(m[0] for m in markers) / len(markers)
+            cy = sum(m[1] for m in markers) / len(markers)
+            # Effective radius: max distance from centroid to any marker + that
+            # marker's own radius.  Guarantees the box clears every marker.
+            eff_radius = max(
+                ((mx - cx) ** 2 + (my - cy) ** 2) ** 0.5 + mr
+                for mx, my, mr in markers
+            )
+            try:
+                result = place_callout_annotation(
+                    page, cx, cy, eff_radius, txt, placed_boxes,
+                    font_size=callout_font_size,
+                    max_box_width=callout_max_box_width,
+                    polygon_points=None,
+                    forbidden_rects=polygon_rects,
+                    committed_lines=committed_lines,
+                    marker_zones=marker_zones,
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to place callout '{txt}': {e}", exc_info=True)
+                continue
+
+            if not result:
+                continue
+
+            # The placed box is the last one appended to placed_boxes.
+            box_rect = placed_boxes[-1]
+
+            # For each marker in the cluster, draw a leader line from the
+            # closest point on the box border to the marker centre.
+            for mx, my, mr in markers:
+                bx0, by0, bx1, by1 = box_rect.x0, box_rect.y0, box_rect.x1, box_rect.y1
+                ax = bx0 if mx <= bx0 else (bx1 if mx >= bx1 else (bx0 + bx1) / 2)
+                ay = by0 if my <= by0 else (by1 if my >= by1 else (by0 + by1) / 2)
+                attach_pt = fitz.Point(ax, ay)
+                tip_pt = fitz.Point(mx, my)
+                leader_lines.append((attach_pt, tip_pt))
+                committed_lines.append((attach_pt, tip_pt))
+
+        # ── Place polygon callouts (unchanged, perimeter-snap behaviour) ──
+        for item in polygon_callouts:
             cx, cy, r, callout_text = item[:4]
-            poly_pts = item[4] if len(item) > 4 else None
+            poly_pts = item[4]
             try:
                 result = place_callout_annotation(
                     page, cx, cy, r, callout_text, placed_boxes,
@@ -1227,9 +1290,23 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                     marker_zones=marker_zones,
                 )
                 if result:
+                    leader_lines.append(result)
                     committed_lines.append(result)
             except Exception as e:
                 logger.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
+
+    # ── Draw leader lines as Line annotations (rendered ON TOP of all boxes) ─
+    if leader_lines:
+        logger.info(f"Drawing {len(leader_lines)} leader line annotation(s)...")
+        for attach_pt, tip_pt in leader_lines:
+            try:
+                line_annot = page.add_line_annot(attach_pt, tip_pt)
+                line_annot.set_colors(stroke=(0, 0, 0))
+                line_annot.set_border(width=1.5)
+                line_annot.update()
+            except Exception as e:
+                logger.error(f"❌ Failed to draw leader line: {e}", exc_info=True)
+        logger.info(f"✅ {len(leader_lines)} leader line(s) drawn on top of callout boxes")
 
     logger.info(f"\n{'=' * 80}")
     logger.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
