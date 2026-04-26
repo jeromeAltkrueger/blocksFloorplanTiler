@@ -689,10 +689,97 @@ def place_callout_annotation(
                 best_score = score
                 best_rect = candidate
 
-    # ── PASS 2 (soft fallback): if no perfectly clean spot exists, allow
-    # overlaps/crossings but penalise them heavily so we pick the least-bad option.
+    # ── PASS 2: HARD-REJECT margin-lane grid scan ─────────────────────────────
+    # If the radial search found nothing, sweep a regular grid across the
+    # entire page.  Boxes are arranged neatly stacked next to each other;
+    # overlaps with placed boxes / marker zones / polygon fills are NEVER
+    # allowed.  Candidates are scored to prefer (a) closeness to the marker
+    # and (b) hugging the nearest page edge — this produces tidy "lanes" of
+    # callouts along the page margins instead of a chaotic interior.
     if best_rect is None:
-        logger.warning(f"   ⚠️  No clean placement found for '{text[:30]}…' — using soft fallback")
+        logger.info(f"   [pass-2 grid] radial search exhausted — scanning page grid for clean slot")
+        # Step size: half-box so adjacent slots can sit flush with MARGIN gap
+        grid_step_x = max(box_width * 0.5, 8.0)
+        grid_step_y = max(box_height * 0.5, 8.0)
+        # Sweep grid origin from page top-left
+        x = page_rect.x0 + 2.0
+        clean_candidates: List[Tuple[float, fitz.Rect]] = []
+        while x + box_width <= page_rect.x1:
+            y = page_rect.y0 + 2.0
+            while y + box_height <= page_rect.y1:
+                candidate = fitz.Rect(x, y, x + box_width, y + box_height)
+                # Hard: polygon fills
+                if forbidden_rects and any(not (candidate & fr).is_empty for fr in forbidden_rects):
+                    y += grid_step_y
+                    continue
+                # Hard: marker safe zones
+                if marker_zones and any(not (candidate & mz).is_empty for mz in marker_zones):
+                    y += grid_step_y
+                    continue
+                # Hard: existing boxes (with MARGIN)
+                clash = False
+                for placed in placed_boxes:
+                    padded = placed + (-MARGIN, -MARGIN, MARGIN, MARGIN)
+                    if not (candidate & padded).is_empty:
+                        clash = True
+                        break
+                if clash:
+                    y += grid_step_y
+                    continue
+                # Compute proposed leader line for this candidate
+                cax = candidate.x0 if marker_x <= candidate.x0 else (
+                    candidate.x1 if marker_x >= candidate.x1 else (candidate.x0 + candidate.x1) / 2)
+                cay = candidate.y0 if marker_y <= candidate.y0 else (
+                    candidate.y1 if marker_y >= candidate.y1 else (candidate.y0 + candidate.y1) / 2)
+                c_attach = fitz.Point(cax, cay)
+                c_tip = (_closest_point_on_polygon(c_attach, polygon_points)
+                         if polygon_points else fitz.Point(marker_x, marker_y))
+                # Hard: leader line must not pass through any placed box
+                if any(_segment_intersects_rect(c_attach, c_tip, pb) for pb in placed_boxes):
+                    y += grid_step_y
+                    continue
+                # Hard: existing leader lines must not pass through this candidate box
+                if committed_lines and any(
+                        _segment_intersects_rect(cl_a, cl_t, candidate)
+                        for cl_a, cl_t in committed_lines):
+                    y += grid_step_y
+                    continue
+                # Soft: prefer closeness to marker + hugging nearest page edge
+                leader_len = ((cax - marker_x) ** 2 + (cay - marker_y) ** 2) ** 0.5
+                edge_dist = min(
+                    candidate.x0 - page_rect.x0,
+                    page_rect.x1 - candidate.x1,
+                    candidate.y0 - page_rect.y0,
+                    page_rect.y1 - candidate.y1,
+                )
+                # Crossing penalty: prefer fewer crossings even though they're not hard-rejected here
+                crossings = 0
+                if committed_lines:
+                    crossings = sum(
+                        1 for cl_a, cl_t in committed_lines
+                        if _segments_intersect(c_attach, c_tip, cl_a, cl_t)
+                    )
+                score = leader_len + edge_dist * 0.5 + crossings * page_diag * 2
+                clean_candidates.append((score, candidate))
+                y += grid_step_y
+            x += grid_step_x
+
+        if clean_candidates:
+            clean_candidates.sort(key=lambda t: t[0])
+            best_rect = clean_candidates[0][1]
+            logger.info(
+                f"   [pass-2 grid] found {len(clean_candidates)} clean slot(s);"
+                f" picked best with score={clean_candidates[0][0]:.1f}"
+            )
+
+    # ── PASS 3 (last resort): truly nowhere clean — allow overlaps but
+    # heavily penalise.  Only reached if Pass 2 grid scan found ZERO clean
+    # positions on the entire page (page is genuinely full).
+    if best_rect is None:
+        logger.warning(
+            f"   ⚠️  Page is full — '{text[:30]}…' will overlap "
+            f"({len(placed_boxes)} boxes already placed)"
+        )
         BIG_PENALTY = page_diag * 1000
         best_score = float("inf")
         for effective_dist in DIST_STEPS:
@@ -713,36 +800,27 @@ def place_callout_annotation(
                 candidate = fitz.Rect(bx0, by0, bx0 + box_width, by0 + box_height)
                 if not page_rect.contains(candidate):
                     continue
+                if forbidden_rects and any(not (candidate & fr).is_empty for fr in forbidden_rects):
+                    continue
 
-                # Hard even in Pass 2: NEVER place on polygon fills
-                if forbidden_rects:
-                    if any(not (candidate & fr).is_empty for fr in forbidden_rects):
-                        continue
-
-                # Soft in Pass 2: heavily penalise overlap with markers/shapes
-                # but don't hard-reject (box is rendered on top, still visible)
                 marker_overlap_penalty = 0.0
                 if marker_zones:
                     for mz in marker_zones:
                         inter = candidate & mz
                         if not inter.is_empty:
                             marker_overlap_penalty += inter.width * inter.height * 10
-
                 score = effective_dist + marker_overlap_penalty
-
                 for placed in placed_boxes:
                     padded = placed + (-MARGIN, -MARGIN, MARGIN, MARGIN)
                     inter = candidate & padded
                     if not inter.is_empty:
                         score += inter.width * inter.height
-
                 ccx0, ccy0, ccx1, ccy1 = candidate.x0, candidate.y0, candidate.x1, candidate.y1
                 cax = ccx0 if marker_x <= ccx0 else (ccx1 if marker_x >= ccx1 else (ccx0 + ccx1) / 2)
                 cay = ccy0 if marker_y <= ccy0 else (ccy1 if marker_y >= ccy1 else (ccy0 + ccy1) / 2)
                 c_attach = fitz.Point(cax, cay)
                 c_tip = (_closest_point_on_polygon(c_attach, polygon_points)
                          if polygon_points else fitz.Point(marker_x, marker_y))
-
                 if committed_lines:
                     for cl_a, cl_t in committed_lines:
                         if _segments_intersect(c_attach, c_tip, cl_a, cl_t):
@@ -750,17 +828,15 @@ def place_callout_annotation(
                     for pb in placed_boxes:
                         if _segment_intersects_rect(c_attach, c_tip, pb):
                             score += BIG_PENALTY
-                if committed_lines:
                     for cl_a, cl_t in committed_lines:
                         if _segment_intersects_rect(cl_a, cl_t, candidate):
                             score += BIG_PENALTY
-
                 if score < best_score:
                     best_score = score
                     best_rect = candidate
 
     if best_rect is None:
-        # All directions at all distances clipped by page bounds — clamp to right edge
+        # Absolute fallback: clamp into page bounds
         bx0 = min(marker_x + min_dist, page_rect.x1 - box_width)
         by0 = max(page_rect.y0, min(marker_y - box_height / 2, page_rect.y1 - box_height))
         best_rect = fitz.Rect(bx0, by0, bx0 + box_width, by0 + box_height)
@@ -1188,6 +1264,25 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     leader_lines: List[Tuple[fitz.Point, fitz.Point]] = []  # (attach, tip) pairs to render as Line annots
     if pending_callouts:
         logger.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
+
+        # ── Sort callouts so spatially-adjacent markers are placed consecutively ─
+        # Without this, placement order = arbitrary JSON input order, which causes
+        # late callouts to be shoved across the page because their natural side
+        # was already consumed by an unrelated marker.  Sorting by angular order
+        # around the cluster centroid means neighbours pick neighbouring slots,
+        # producing tidy lanes along page edges.
+        if len(pending_callouts) > 1:
+            import math as _math
+            anchor_cx = sum(it[0] for it in pending_callouts) / len(pending_callouts)
+            anchor_cy = sum(it[1] for it in pending_callouts) / len(pending_callouts)
+            pending_callouts.sort(
+                key=lambda it: _math.atan2(it[1] - anchor_cy, it[0] - anchor_cx)
+            )
+            logger.info(
+                f"   Sorted callouts by angular order around centroid "
+                f"({anchor_cx:.1f}, {anchor_cy:.1f}) for tidy lane placement"
+            )
+
         # Build marker safe zones from ALL drawn shapes (markers + polygons)
         # so text boxes never cover any drawn annotation on the floorplan.
         SAFE_PAD = 20.0  # generous clearance around every shape
