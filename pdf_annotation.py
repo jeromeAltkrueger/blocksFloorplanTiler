@@ -998,18 +998,57 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     Returns:
         Annotated PDF as bytes (returns original bytes unmodified on failure)
     """
-    # Validate PDF content before opening
-    if not pdf_bytes or not pdf_bytes[:5] == b"%PDF-":
-        logging.error(f"Downloaded content is NOT a PDF ({len(pdf_bytes)} bytes, magic={pdf_bytes[:20]!r}). Returning original.")
+    # ── PDF header / size validation ─────────────────────────────────────────
+    logging.info(f"PDF bytes received: {len(pdf_bytes):,} bytes")
+    if not pdf_bytes:
+        logging.error("PDF bytes are empty. Returning original.")
+        return pdf_bytes
+    magic = pdf_bytes[:8]
+    logging.info(f"PDF magic bytes: {magic!r}")
+    if magic[:5] != b"%PDF-":
+        logging.error(f"Downloaded content is NOT a PDF ({len(pdf_bytes):,} bytes, magic={pdf_bytes[:20]!r}). Returning original.")
+        return pdf_bytes
+    # Log PDF version string (e.g. b'%PDF-1.7')
+    version_line = pdf_bytes[:20].split(b"\n")[0].strip()
+    logging.info(f"PDF version header: {version_line!r}")
+
+    # ── Open PDF ──────────────────────────────────────────────────────────────
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as open_err:
+        logging.error(f"fitz.open() raised an exception: {open_err!r} — PDF may be corrupt. Returning original.", exc_info=True)
         return pdf_bytes
 
-    # Open PDF
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    logging.info(f"fitz.open() succeeded")
+    logging.info(f"  is_pdf       : {doc.is_pdf}")
+    logging.info(f"  page_count   : {doc.page_count}")
+    logging.info(f"  needs_pass   : {doc.needs_pass}")
+    logging.info(f"  is_encrypted : {doc.is_encrypted}")
+    logging.info(f"  is_repaired  : {doc.is_repaired}")
+    try:
+        pdf_meta = doc.metadata
+        logging.info(
+            f"  metadata     : producer={pdf_meta.get('producer')!r}  "
+            f"creator={pdf_meta.get('creator')!r}  "
+            f"format={pdf_meta.get('format')!r}"
+        )
+    except Exception:
+        logging.warning("  metadata     : (could not read)")
+
     if not doc.is_pdf or doc.page_count == 0:
         logging.error(f"fitz opened file but is_pdf={doc.is_pdf}, pages={doc.page_count}. Returning original.")
         doc.close()
         return pdf_bytes
+
     page = doc[0]  # First page
+    logging.info(f"Page 0 info:")
+    logging.info(f"  mediabox     : {page.mediabox}")
+    logging.info(f"  cropbox      : {page.cropbox}")
+    logging.info(f"  rect         : {page.rect}  ({page.rect.width:.1f} x {page.rect.height:.1f} pt)")
+    logging.info(f"  rotation     : {page.rotation}°")
+    existing_annots = list(page.annots())
+    logging.info(f"  existing annots: {len(existing_annots)} " +
+                 ("(" + ", ".join(a.type[1] for a in existing_annots) + ")" if existing_annots else "(none)"))
 
     logging.info(f"=" * 80)
     logging.info(f"PDF ANNOTATION")
@@ -1063,6 +1102,24 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"  Objects    : {len(objects)} total — " + ", ".join(f"{v}x {k}" for k, v in type_counts.items()))
     logging.info(f"=" * 80)
 
+    # ── Dump all incoming objects for debugging ───────────────────────────────
+    logging.info("INCOMING OBJECTS DUMP:")
+    for _di, _obj in enumerate(objects):
+        _props = _obj.get("properties", {})
+        _geom  = _obj.get("geometry", {})
+        logging.info(
+            f"  [{_di+1}/{len(objects)}] geo={_geom.get('type')} "
+            f"prop_type={_props.get('type')} "
+            f"overlay={_props.get('overlay') or _obj.get('overlay')!r} "
+            f"label={_props.get('label')!r} "
+            f"content={_props.get('content')!r} "
+            f"text={_props.get('text')!r} "
+            f"color={_props.get('color')!r} "
+            f"fontSize={_props.get('fontSize')!r} "
+            f"coords={str(_geom.get('coordinates', []))[:80]}"
+        )
+    logging.info(f"=" * 80)
+
     # Detect whitespace trim offset (needed when PDF had margins that were cropped)
     trim_offset = detect_trim_offset(page, metadata)
     logging.info(f"Trim offset: left={trim_offset[0]:.1f}, top={trim_offset[1]:.1f} px")
@@ -1080,29 +1137,55 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     for i, obj in enumerate(objects):
         try:
             logging.info(f"\n--- Object {i + 1}/{len(objects)} ---")
-            obj_type = obj.get("properties", {}).get("type", "unknown")
+            properties = obj.get("properties", {})
+            obj_type = properties.get("type", "unknown")
             geometry = obj.get("geometry", {})
             geo_type = geometry.get("type")
             coordinates = geometry.get("coordinates", [])
 
-            logging.info(f"Type: {obj_type}, Geometry: {geo_type}")
+            logging.info(f"Type: {obj_type}, Geometry: {geo_type}, Properties: {properties}")
 
             if geo_type == "Polygon":
                 config = ANNOTATION_CONFIG["polygon"].copy()
-                overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
-                logging.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}")
+                overlay = obj.get("overlay") or properties.get("overlay")
+                logging.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}, overlay={overlay!r}")
                 draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects, polygon_rects)
                 objects_drawn += 1
 
+            elif geo_type == "Point" and obj_type == "text":
+                # Text field: render as a FreeText callout/label at position
+                text_content = (properties.get("text") or properties.get("content")
+                                or properties.get("label") or properties.get("overlay") or "")
+                logging.info(f"   TEXT FIELD: content={text_content!r}, coords={coordinates}")
+                if text_content:
+                    x_pdf, y_pdf = transform_coords(coordinates, metadata, trim_offset)
+                    logging.info(f"   TEXT FIELD -> PDF coords: ({x_pdf:.2f}, {y_pdf:.2f})")
+                    text_config = ANNOTATION_CONFIG["text"].copy()
+                    font_size_override = properties.get("fontSize")
+                    if font_size_override:
+                        try:
+                            text_config["font_size"] = float(font_size_override)
+                        except (TypeError, ValueError):
+                            pass
+                    draw_text_on_pdf(page, [x_pdf, y_pdf], text_content, text_config)
+                    logging.info(f"✅ Text field drawn: {text_content!r} at PDF ({x_pdf:.1f}, {y_pdf:.1f})")
+                    objects_drawn += 1
+                else:
+                    logging.warning(f"⚠️  Text field has no content — properties={properties}")
+
             elif geo_type == "Point":
                 config = ANNOTATION_CONFIG["marker"].copy()
-                label = obj.get("properties", {}).get("content") or obj.get("properties", {}).get("label")
-                overlay = obj.get("overlay") or obj.get("properties", {}).get("overlay")
+                label = properties.get("content") or properties.get("label")
+                overlay = obj.get("overlay") or properties.get("overlay")
+                logging.info(f"   MARKER: label={label!r}, overlay={overlay!r}, coords={coordinates}")
                 draw_marker_on_pdf(page, coordinates, metadata, config, label, overlay, trim_offset, pending_callouts, shape_rects)
                 objects_drawn += 1
 
             else:
-                logging.warning(f"⚠️  Unknown type: {obj_type}")
+                logging.warning(
+                    f"⚠️  Unhandled object: geo_type={geo_type!r}, obj_type={obj_type!r}, "
+                    f"properties={properties}, coords={str(coordinates)[:80]}"
+                )
 
         except Exception as e:
             logging.error(f"❌ Error drawing object {i + 1}: {str(e)}", exc_info=True)
@@ -1150,28 +1233,35 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logging.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logging.info(f"{'=' * 80}\n")
 
-    # Save to bytes — try clean save first, then incremental for broken PDFs
+    # ── Save annotated PDF ────────────────────────────────────────────────────
+    logging.info("Saving annotated PDF...")
+    logging.info(f"  Input size      : {len(pdf_bytes):,} bytes")
     output = io.BytesIO()
+
     # Incremental save first (safe — only appends, never touches broken xrefs)
     incremental_bytes = None
     try:
         incremental_bytes = doc.tobytes(incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
-        logging.info("✅ Incremental save succeeded")
+        logging.info(f"✅ Incremental save succeeded: {len(incremental_bytes):,} bytes "
+                     f"(+{len(incremental_bytes)-len(pdf_bytes):+,} bytes vs input)")
     except Exception as inc_err:
-        logging.warning(f"⚠️  Incremental save failed ({inc_err})")
+        logging.warning(f"⚠️  Incremental save failed: {inc_err!r}")
 
-    # Try clean save (smaller output, removes orphans) — only if doc state is still good
+    # Try clean save (smaller output, removes orphans)
     try:
         doc.save(output, garbage=3, deflate=True)
+        clean_bytes = output.getvalue()
         doc.close()
-        logging.info("✅ Clean save succeeded")
-        return output.getvalue()
+        logging.info(f"✅ Clean save succeeded: {len(clean_bytes):,} bytes "
+                     f"(+{len(clean_bytes)-len(pdf_bytes):+,} bytes vs input)")
+        return clean_bytes
     except Exception as save_err:
-        logging.warning(f"⚠️  Clean save failed ({save_err})")
+        logging.warning(f"⚠️  Clean save failed: {save_err!r}")
 
     doc.close()
 
     if incremental_bytes:
+        logging.info("Using incremental save as fallback.")
         return incremental_bytes
 
     logging.error("⚠️  Both save methods failed, returning original PDF unmodified")
