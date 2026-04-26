@@ -1187,44 +1187,15 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     # page with no shape outlines interfering with the overlap check.
     leader_lines: List[Tuple[fitz.Point, fitz.Point]] = []  # (attach, tip) pairs to render as Line annots
     if pending_callouts:
-        # ── Cluster marker callouts (4-tuple) with IDENTICAL text ─────────
-        # Polygon callouts (5-tuple) stay individual — they need perimeter
-        # snapping which only makes sense per-polygon.
-        polygon_callouts: List = []
-        clusters: List[Tuple[List[Tuple[float, float, float]], str]] = []
-        text_to_cluster: Dict[str, int] = {}
-        for item in pending_callouts:
-            if len(item) > 4:
-                polygon_callouts.append(item)
-                continue
-            mx, my, mr, txt = item
-            if txt in text_to_cluster:
-                clusters[text_to_cluster[txt]][0].append((mx, my, mr))
-            else:
-                text_to_cluster[txt] = len(clusters)
-                clusters.append(([(mx, my, mr)], txt))
-
-        n_marker_callouts = sum(len(c[0]) for c in clusters)
-        logger.info(
-            f"\nCallout clustering: {n_marker_callouts} marker callout(s) → "
-            f"{len(clusters)} unique-text group(s); {len(polygon_callouts)} polygon callout(s)"
-        )
-        for ci, (markers, txt) in enumerate(clusters):
-            if len(markers) > 1:
-                logger.info(f"  cluster {ci+1}: {len(markers)}× '{txt[:50]}'")
-
+        logger.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
         # Build marker safe zones from ALL drawn shapes (markers + polygons)
         # so text boxes never cover any drawn annotation on the floorplan.
         SAFE_PAD = 20.0  # generous clearance around every shape
         for sr in shape_rects:
             padded = sr + (-SAFE_PAD, -SAFE_PAD, SAFE_PAD, SAFE_PAD)
             marker_zones.append(padded)
-        # Also add extra-padded zones around each marker anchor point
-        for markers, _ in clusters:
-            for mx, my, mr in markers:
-                pad = mr + SAFE_PAD
-                marker_zones.append(fitz.Rect(mx - pad, my - pad, mx + pad, my + pad))
-        for item in polygon_callouts:
+        # Also add extra-padded zones around each callout anchor point
+        for item in pending_callouts:
             mx, my, mr = item[0], item[1], item[2]
             pad = mr + SAFE_PAD
             marker_zones.append(fitz.Rect(mx - pad, my - pad, mx + pad, my + pad))
@@ -1232,53 +1203,9 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         # Seed with shape bounding boxes so callouts won't overlap fills/circles.
         placed_boxes: List[fitz.Rect] = list(shape_rects)
         committed_lines: List[Tuple[fitz.Point, fitz.Point]] = []
-
-        # ── Place clustered marker callouts ────────────────────────────────
-        for markers, txt in clusters:
-            # Compute centroid of all markers in the cluster
-            cx = sum(m[0] for m in markers) / len(markers)
-            cy = sum(m[1] for m in markers) / len(markers)
-            # Effective radius: max distance from centroid to any marker + that
-            # marker's own radius.  Guarantees the box clears every marker.
-            eff_radius = max(
-                ((mx - cx) ** 2 + (my - cy) ** 2) ** 0.5 + mr
-                for mx, my, mr in markers
-            )
-            try:
-                result = place_callout_annotation(
-                    page, cx, cy, eff_radius, txt, placed_boxes,
-                    font_size=callout_font_size,
-                    max_box_width=callout_max_box_width,
-                    polygon_points=None,
-                    forbidden_rects=polygon_rects,
-                    committed_lines=committed_lines,
-                    marker_zones=marker_zones,
-                )
-            except Exception as e:
-                logger.error(f"❌ Failed to place callout '{txt}': {e}", exc_info=True)
-                continue
-
-            if not result:
-                continue
-
-            # The placed box is the last one appended to placed_boxes.
-            box_rect = placed_boxes[-1]
-
-            # For each marker in the cluster, draw a leader line from the
-            # closest point on the box border to the marker centre.
-            for mx, my, mr in markers:
-                bx0, by0, bx1, by1 = box_rect.x0, box_rect.y0, box_rect.x1, box_rect.y1
-                ax = bx0 if mx <= bx0 else (bx1 if mx >= bx1 else (bx0 + bx1) / 2)
-                ay = by0 if my <= by0 else (by1 if my >= by1 else (by0 + by1) / 2)
-                attach_pt = fitz.Point(ax, ay)
-                tip_pt = fitz.Point(mx, my)
-                leader_lines.append((attach_pt, tip_pt))
-                committed_lines.append((attach_pt, tip_pt))
-
-        # ── Place polygon callouts (unchanged, perimeter-snap behaviour) ──
-        for item in polygon_callouts:
+        for item in pending_callouts:
             cx, cy, r, callout_text = item[:4]
-            poly_pts = item[4]
+            poly_pts = item[4] if len(item) > 4 else None
             try:
                 result = place_callout_annotation(
                     page, cx, cy, r, callout_text, placed_boxes,
