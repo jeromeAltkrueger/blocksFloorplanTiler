@@ -1229,7 +1229,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             try:
                 line_annot = page.add_line_annot(attach_pt, tip_pt)
                 line_annot.set_colors(stroke=(0, 0, 0))
-                line_annot.set_border(width=1.5)
+                line_annot.set_border(width=3.0)
                 line_annot.update()
             except Exception as e:
                 logger.error(f"❌ Failed to draw leader line: {e}", exc_info=True)
