@@ -698,32 +698,54 @@ def place_callout_annotation(
     # callouts along the page margins instead of a chaotic interior.
     if best_rect is None:
         logger.info(f"   [pass-2 grid] radial search exhausted — scanning page grid for clean slot")
-        # Step size: half-box so adjacent slots can sit flush with MARGIN gap
-        grid_step_x = max(box_width * 0.5, 8.0)
-        grid_step_y = max(box_height * 0.5, 8.0)
-        # Sweep grid origin from page top-left
-        x = page_rect.x0 + 2.0
+        # Step size: one full box dimension — finer steps produced ~4× more
+        # cells but no meaningfully better placements once boxes have MARGIN.
+        grid_step_x = max(box_width, 8.0)
+        grid_step_y = max(box_height, 8.0)
+        start_x = page_rect.x0 + 2.0
+        start_y = page_rect.y0 + 2.0
+
+        # Pre-build a blocked-cell set so the per-cell placed-box clash check
+        # is O(1) instead of O(n_boxes).  A candidate at integer column c / row r
+        # occupies [start_x + c*step_x, +box_width] × [start_y + r*step_y, +box_height].
+        # It clashes with a padded placed box when their rects overlap, which maps
+        # to a contiguous range of (c, r) pairs — mark all of them upfront.
+        blocked_cells: set = set()
+        for placed in placed_boxes:
+            padded = placed + (-MARGIN, -MARGIN, MARGIN, MARGIN)
+            # Columns c where candidate x-interval overlaps padded x-interval:
+            #   start_x + c*step_x + box_width > padded.x0  →  c > (padded.x0 - box_width - start_x)/step_x
+            #   start_x + c*step_x             < padded.x1  →  c < (padded.x1 - start_x)/step_x
+            # Use conservative (slightly wider) integer ranges to avoid float edge cases.
+            c_lo = max(0, int((padded.x0 - box_width - start_x) / grid_step_x) - 1)
+            c_hi = int((padded.x1 - start_x) / grid_step_x) + 2
+            r_lo = max(0, int((padded.y0 - box_height - start_y) / grid_step_y) - 1)
+            r_hi = int((padded.y1 - start_y) / grid_step_y) + 2
+            for bc in range(c_lo, c_hi + 1):
+                for br in range(r_lo, r_hi + 1):
+                    blocked_cells.add((bc, br))
+
         clean_candidates: List[Tuple[float, fitz.Rect]] = []
+        col = 0
+        x = start_x
         while x + box_width <= page_rect.x1:
-            y = page_rect.y0 + 2.0
+            row = 0
+            y = start_y
             while y + box_height <= page_rect.y1:
+                # Fast O(1) placed-box clash check via pre-built set
+                if (col, row) in blocked_cells:
+                    row += 1
+                    y += grid_step_y
+                    continue
                 candidate = fitz.Rect(x, y, x + box_width, y + box_height)
                 # Hard: polygon fills
                 if forbidden_rects and any(not (candidate & fr).is_empty for fr in forbidden_rects):
+                    row += 1
                     y += grid_step_y
                     continue
                 # Hard: marker safe zones
                 if marker_zones and any(not (candidate & mz).is_empty for mz in marker_zones):
-                    y += grid_step_y
-                    continue
-                # Hard: existing boxes (with MARGIN)
-                clash = False
-                for placed in placed_boxes:
-                    padded = placed + (-MARGIN, -MARGIN, MARGIN, MARGIN)
-                    if not (candidate & padded).is_empty:
-                        clash = True
-                        break
-                if clash:
+                    row += 1
                     y += grid_step_y
                     continue
                 # Compute proposed leader line for this candidate
@@ -736,12 +758,14 @@ def place_callout_annotation(
                          if polygon_points else fitz.Point(marker_x, marker_y))
                 # Hard: leader line must not pass through any placed box
                 if any(_segment_intersects_rect(c_attach, c_tip, pb) for pb in placed_boxes):
+                    row += 1
                     y += grid_step_y
                     continue
                 # Hard: existing leader lines must not pass through this candidate box
                 if committed_lines and any(
                         _segment_intersects_rect(cl_a, cl_t, candidate)
                         for cl_a, cl_t in committed_lines):
+                    row += 1
                     y += grid_step_y
                     continue
                 # Soft: prefer closeness to marker + hugging nearest page edge
@@ -761,7 +785,9 @@ def place_callout_annotation(
                     )
                 score = leader_len + edge_dist * 0.5 + crossings * page_diag * 2
                 clean_candidates.append((score, candidate))
+                row += 1
                 y += grid_step_y
+            col += 1
             x += grid_step_x
 
         if clean_candidates:
