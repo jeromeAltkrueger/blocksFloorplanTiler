@@ -186,7 +186,8 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                        trim_offset: Tuple[float, float] = (0.0, 0.0),
                        pending_callouts: List = None,
                        shape_rects: List = None,
-                       polygon_rects: List = None) -> None:
+                       polygon_rects: List = None,
+                       shared_shape=None) -> None:
     """
     Draw a filled polygon on the PDF page, optionally with centered overlay text.
 
@@ -218,7 +219,10 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
     if len(pdf_points) >= 3:
         # draw_polyline + closePath=True is the correct API for filled closed
         # polygons in PyMuPDF 1.23.x (Shape.draw_polygon does not exist)
-        shape = page.new_shape()
+        # If a shared_shape is passed, we defer commit() to the caller so that
+        # all polygons are flushed in a single content-stream write (O(1) vs O(n²)).
+        _own_shape = shared_shape is None
+        shape = page.new_shape() if _own_shape else shared_shape
         shape.draw_polyline(pdf_points)
         shape.finish(
             fill=config["fill_color"],
@@ -228,7 +232,8 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
             stroke_opacity=config.get("stroke_opacity", 0.0),
             closePath=True
         )
-        shape.commit()
+        if _own_shape:
+            shape.commit()
         logger.info(f"✅ Polygon drawn with {len(pdf_points)} points")
 
         # Register bounding box so callout placement avoids the polygon fill.
@@ -1227,6 +1232,9 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     polygon_rects: List[fitz.Rect] = [] # hard-exclusion zones (polygon fills)
     marker_zones: List[fitz.Rect] = []  # safe zones around each marker (boxes must not cover)
     objects_drawn = 0
+    # One shared Shape for all polygons — commit() is called once after the loop
+    # instead of once per polygon, avoiding O(n²) content-stream appends.
+    polygon_shape = page.new_shape()
     for i, obj in enumerate(objects):
         try:
             logger.info(f"\n--- Object {i + 1}/{len(objects)} ---")
@@ -1242,7 +1250,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                 config = ANNOTATION_CONFIG["polygon"].copy()
                 overlay = obj.get("overlay") or properties.get("overlay")
                 logger.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}, overlay={overlay!r}")
-                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects, polygon_rects)
+                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects, polygon_rects, shared_shape=polygon_shape)
                 objects_drawn += 1
 
             elif geo_type == "Point" and obj_type == "text":
@@ -1283,6 +1291,9 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         except Exception as e:
             logger.error(f"❌ Error drawing object {i + 1}: {str(e)}", exc_info=True)
             continue
+
+    # Flush all polygon draws in a single content-stream write
+    polygon_shape.commit()
 
     # ── Place deferred Callout annotations ──────────────────────────────────
     # Done after all burned-in shapes so the placement algorithm sees a clean
