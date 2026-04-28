@@ -211,10 +211,9 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
     pdf_points = []
     for point in outer_ring:
         x, y = point[0], point[1]
-        logger.info(f"  Leaflet: [{x}, {y}]")
         x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
-        logger.info(f"  -> PDF: [{x_pdf:.2f}, {y_pdf:.2f}]")
         pdf_points.append(fitz.Point(x_pdf, y_pdf))
+    logger.debug(f"  {len(pdf_points)} points transformed to PDF coords")
 
     if len(pdf_points) >= 3:
         # draw_polyline + closePath=True is the correct API for filled closed
@@ -460,6 +459,97 @@ def _segment_intersects_rect(p1: fitz.Point, p2: fitz.Point,
     return False
 
 
+class _RectGrid:
+    """Coarse spatial hash of axis-aligned rects.
+
+    Each rect is registered in every cell its bounding box overlaps.
+    `query(rect)` returns the indices of all candidate rects whose bucket
+    intersects the query rect — a small superset that the caller filters
+    with the precise intersection test.
+
+    Used to avoid the O(n) per-candidate scan over placed_boxes / polygon
+    fills / leader-lines that otherwise dominates dense-page placement.
+    """
+    __slots__ = ("cell", "buckets", "n", "rects")
+
+    def __init__(self, rects: List[fitz.Rect], cell_size: float = 200.0):
+        self.cell = max(cell_size, 1.0)
+        self.buckets: Dict[Tuple[int, int], List[int]] = {}
+        self.rects: List[fitz.Rect] = list(rects)
+        self.n = len(self.rects)
+        for i, r in enumerate(self.rects):
+            self._index(i, r)
+
+    def _index(self, idx: int, r: fitz.Rect) -> None:
+        c = self.cell
+        c0, r0 = int(r.x0 // c), int(r.y0 // c)
+        c1, r1 = int(r.x1 // c), int(r.y1 // c)
+        for cc in range(c0, c1 + 1):
+            for rr in range(r0, r1 + 1):
+                self.buckets.setdefault((cc, rr), []).append(idx)
+
+    def add(self, r: fitz.Rect) -> int:
+        idx = self.n
+        self.rects.append(r)
+        self.n += 1
+        self._index(idx, r)
+        return idx
+
+    def query(self, r: fitz.Rect) -> List[int]:
+        c = self.cell
+        c0, r0 = int(r.x0 // c), int(r.y0 // c)
+        c1, r1 = int(r.x1 // c), int(r.y1 // c)
+        out: set = set()
+        for cc in range(c0, c1 + 1):
+            for rr in range(r0, r1 + 1):
+                bucket = self.buckets.get((cc, rr))
+                if bucket:
+                    out.update(bucket)
+        return list(out)
+
+
+class _SegmentGrid:
+    """Spatial hash of (attach, tip) leader-line segments by bbox."""
+    __slots__ = ("cell", "buckets", "n", "segs")
+
+    def __init__(self, segs: List[Tuple[fitz.Point, fitz.Point]], cell_size: float = 200.0):
+        self.cell = max(cell_size, 1.0)
+        self.buckets: Dict[Tuple[int, int], List[int]] = {}
+        self.segs: List[Tuple[fitz.Point, fitz.Point]] = list(segs)
+        self.n = len(self.segs)
+        for i, (a, b) in enumerate(self.segs):
+            self._index(i, a, b)
+
+    def _index(self, idx: int, a: fitz.Point, b: fitz.Point) -> None:
+        c = self.cell
+        x0, x1 = (a.x, b.x) if a.x <= b.x else (b.x, a.x)
+        y0, y1 = (a.y, b.y) if a.y <= b.y else (b.y, a.y)
+        c0, r0 = int(x0 // c), int(y0 // c)
+        c1, r1 = int(x1 // c), int(y1 // c)
+        for cc in range(c0, c1 + 1):
+            for rr in range(r0, r1 + 1):
+                self.buckets.setdefault((cc, rr), []).append(idx)
+
+    def add(self, a: fitz.Point, b: fitz.Point) -> int:
+        idx = self.n
+        self.segs.append((a, b))
+        self.n += 1
+        self._index(idx, a, b)
+        return idx
+
+    def query(self, r: fitz.Rect) -> List[int]:
+        c = self.cell
+        c0, r0 = int(r.x0 // c), int(r.y0 // c)
+        c1, r1 = int(r.x1 // c), int(r.y1 // c)
+        out: set = set()
+        for cc in range(c0, c1 + 1):
+            for rr in range(r0, r1 + 1):
+                bucket = self.buckets.get((cc, rr))
+                if bucket:
+                    out.update(bucket)
+        return list(out)
+
+
 def place_callout_annotation(
         page: fitz.Page,
         marker_x: float,
@@ -587,12 +677,12 @@ def place_callout_annotation(
     # Gap between neighbouring callout boxes (enough to read clearly)
     MARGIN = font_size * 2.0
 
-    # Distance steps: reach far across the page so boxes spread to open space.
-    # Dense at short range, progressively sparser at long range.
+    # Distance steps: dense near the marker (where most placements land),
+    # progressively sparser farther out.  Fewer steps = much faster pass-1
+    # while the radial sweep still reaches the page corners.
     page_diag = (page_rect.width ** 2 + page_rect.height ** 2) ** 0.5
     DIST_MULTS = (
-        1.0, 1.3, 1.7, 2.2, 3.0, 4.0, 5.5, 7.5, 10.0, 14.0,
-        19.0, 26.0, 35.0, 48.0, 65.0, 90.0,
+        1.0, 1.5, 2.2, 3.2, 4.8, 7.0, 10.0, 15.0, 25.0, 50.0,
     )
     DIST_STEPS = [min_dist * m for m in DIST_MULTS]
     # Cap so no step exceeds 50% of page diagonal (allows reaching far corners)
@@ -601,10 +691,25 @@ def place_callout_annotation(
     seen = set()
     DIST_STEPS = [d for d in DIST_STEPS if not (round(d, 1) in seen or seen.add(round(d, 1)))]
 
+    # ── Build spatial indices once per call ──────────────────────────────────
+    # All later inner-loop scans become O(k) bucket queries (k ≈ a few items)
+    # instead of O(n) over every placed box / polygon / leader line on the page.
+    # This is the dominant cost on dense pages.
+    SPATIAL_CELL = max(box_width, box_height) * 2.0
+    box_grid = _RectGrid(placed_boxes, cell_size=SPATIAL_CELL)
+    forb_grid = _RectGrid(forbidden_rects or [], cell_size=SPATIAL_CELL)
+    mz_grid = _RectGrid(marker_zones or [], cell_size=SPATIAL_CELL)
+    line_grid = _SegmentGrid(committed_lines or [], cell_size=SPATIAL_CELL)
+
     # ── PASS 1: find a CLEAN placement (no overlaps, no crossings) ────────────
-    # All violations are hard-reject.  Search ALL distances — never break early.
-    # Score balances short leader lines with clearance from existing boxes.
+    # All violations are hard-reject.  Search distances in order; once the best
+    # achievable score at the current distance can no longer beat the best
+    # found so far, stop — the score floor at distance d is 0.8*d.
     for effective_dist in DIST_STEPS:
+        # Early termination: best possible score at this distance = 0.8*d.
+        # If we already have a better score, no farther candidate can win.
+        if best_rect is not None and effective_dist * 0.8 >= best_score:
+            break
         for dx, dy in DIRS:
             if dx > 0:
                 bx0 = marker_x + effective_dist
@@ -626,14 +731,21 @@ def place_callout_annotation(
             if not page_rect.contains(candidate):
                 continue
 
-            # Hard: no polygon fill overlap
-            if forbidden_rects:
-                if any(not (candidate & fr).is_empty for fr in forbidden_rects):
+            # Hard: no polygon fill overlap (spatial-grid filtered)
+            if forb_grid.n:
+                clash = False
+                for fi in forb_grid.query(candidate):
+                    if not (candidate & forb_grid.rects[fi]).is_empty:
+                        clash = True
+                        break
+                if clash:
                     continue
 
             # Hard: no overlap with placed boxes (including margin)
             box_ok = True
-            for placed in placed_boxes:
+            padded_query = candidate + (-MARGIN, -MARGIN, MARGIN, MARGIN)
+            for pi in box_grid.query(padded_query):
+                placed = box_grid.rects[pi]
                 padded = placed + (-MARGIN, -MARGIN, MARGIN, MARGIN)
                 if not (candidate & padded).is_empty:
                     box_ok = False
@@ -642,8 +754,13 @@ def place_callout_annotation(
                 continue
 
             # Hard: no overlap with marker safe zones
-            if marker_zones:
-                if any(not (candidate & mz).is_empty for mz in marker_zones):
+            if mz_grid.n:
+                clash = False
+                for mi in mz_grid.query(candidate):
+                    if not (candidate & mz_grid.rects[mi]).is_empty:
+                        clash = True
+                        break
+                if clash:
                     continue
 
             # Compute proposed leader line
@@ -654,41 +771,59 @@ def place_callout_annotation(
             c_tip = (_closest_point_on_polygon(c_attach, polygon_points)
                      if polygon_points else fitz.Point(marker_x, marker_y))
 
-            if committed_lines:
+            # Bbox of the proposed leader segment for line-grid queries
+            seg_bbox = fitz.Rect(min(c_attach.x, c_tip.x), min(c_attach.y, c_tip.y),
+                                 max(c_attach.x, c_tip.x), max(c_attach.y, c_tip.y))
+
+            if line_grid.n:
                 # Hard: leader line must not cross another leader line
-                if any(_segments_intersect(c_attach, c_tip, cl_a, cl_t)
-                       for cl_a, cl_t in committed_lines):
+                cross = False
+                for li in line_grid.query(seg_bbox):
+                    cl_a, cl_t = line_grid.segs[li]
+                    if _segments_intersect(c_attach, c_tip, cl_a, cl_t):
+                        cross = True
+                        break
+                if cross:
                     continue
 
-                # Hard: leader line must not pass through a placed box
-                if any(_segment_intersects_rect(c_attach, c_tip, pb)
-                       for pb in placed_boxes):
+                # Hard: existing lines must not pass through this box
+                cross = False
+                for li in line_grid.query(candidate):
+                    cl_a, cl_t = line_grid.segs[li]
+                    if _segment_intersects_rect(cl_a, cl_t, candidate):
+                        cross = True
+                        break
+                if cross:
                     continue
 
-            # Hard: existing lines must not pass through this box
-            if committed_lines:
-                if any(_segment_intersects_rect(cl_a, cl_t, candidate)
-                       for cl_a, cl_t in committed_lines):
-                    continue
+            # Hard: leader line must not pass through a placed box
+            cross = False
+            for pi in box_grid.query(seg_bbox):
+                if _segment_intersects_rect(c_attach, c_tip, box_grid.rects[pi]):
+                    cross = True
+                    break
+            if cross:
+                continue
 
             # ── Score: balance short leader line vs clearance from neighbours ──
-            # Clearance = distance to the nearest placed box edge.  A position
-            # that is slightly further from the marker but surrounded by open
-            # space is preferred over one that is close but squeezed between
-            # existing boxes.
-            min_clearance = page_diag
-            for placed in placed_boxes:
+            # Only check boxes within clearance_cap of the candidate — anything
+            # farther doesn't influence min_clearance anyway.
+            clearance_cap = box_height * 3.0
+            min_clearance = clearance_cap
+            clear_query = candidate + (-clearance_cap, -clearance_cap,
+                                        clearance_cap, clearance_cap)
+            for pi in box_grid.query(clear_query):
+                placed = box_grid.rects[pi]
                 dx_gap = max(0, placed.x0 - candidate.x1, candidate.x0 - placed.x1)
                 dy_gap = max(0, placed.y0 - candidate.y1, candidate.y0 - placed.y1)
                 gap_dist = (dx_gap ** 2 + dy_gap ** 2) ** 0.5
-                min_clearance = min(min_clearance, gap_dist)
+                if gap_dist < min_clearance:
+                    min_clearance = gap_dist
 
-            # Score: leader line length, penalised when squeezed near boxes.
-            # Clearance reward caps at 3× box height so distant positions don't
-            # win just because they're far from everything.
-            clearance_cap = box_height * 3.0
-            clearance_reward = min(min_clearance, clearance_cap) / clearance_cap  # 0..1
-            score = effective_dist - clearance_reward * effective_dist * 0.4
+            clearance_reward = min_clearance / clearance_cap  # 0..1
+            # Distance dominates; clearance gives at most a 20% discount so
+            # short leader lines win even against very-open distant slots.
+            score = effective_dist - clearance_reward * effective_dist * 0.2
 
             if score < best_score:
                 best_score = score
@@ -743,16 +878,28 @@ def place_callout_annotation(
                     y += grid_step_y
                     continue
                 candidate = fitz.Rect(x, y, x + box_width, y + box_height)
-                # Hard: polygon fills
-                if forbidden_rects and any(not (candidate & fr).is_empty for fr in forbidden_rects):
-                    row += 1
-                    y += grid_step_y
-                    continue
-                # Hard: marker safe zones
-                if marker_zones and any(not (candidate & mz).is_empty for mz in marker_zones):
-                    row += 1
-                    y += grid_step_y
-                    continue
+                # Hard: polygon fills (spatial)
+                if forb_grid.n:
+                    clash = False
+                    for fi in forb_grid.query(candidate):
+                        if not (candidate & forb_grid.rects[fi]).is_empty:
+                            clash = True
+                            break
+                    if clash:
+                        row += 1
+                        y += grid_step_y
+                        continue
+                # Hard: marker safe zones (spatial)
+                if mz_grid.n:
+                    clash = False
+                    for mi in mz_grid.query(candidate):
+                        if not (candidate & mz_grid.rects[mi]).is_empty:
+                            clash = True
+                            break
+                    if clash:
+                        row += 1
+                        y += grid_step_y
+                        continue
                 # Compute proposed leader line for this candidate
                 cax = candidate.x0 if marker_x <= candidate.x0 else (
                     candidate.x1 if marker_x >= candidate.x1 else (candidate.x0 + candidate.x1) / 2)
@@ -761,18 +908,30 @@ def place_callout_annotation(
                 c_attach = fitz.Point(cax, cay)
                 c_tip = (_closest_point_on_polygon(c_attach, polygon_points)
                          if polygon_points else fitz.Point(marker_x, marker_y))
+                seg_bbox = fitz.Rect(min(c_attach.x, c_tip.x), min(c_attach.y, c_tip.y),
+                                     max(c_attach.x, c_tip.x), max(c_attach.y, c_tip.y))
                 # Hard: leader line must not pass through any placed box
-                if any(_segment_intersects_rect(c_attach, c_tip, pb) for pb in placed_boxes):
+                cross = False
+                for pi in box_grid.query(seg_bbox):
+                    if _segment_intersects_rect(c_attach, c_tip, box_grid.rects[pi]):
+                        cross = True
+                        break
+                if cross:
                     row += 1
                     y += grid_step_y
                     continue
                 # Hard: existing leader lines must not pass through this candidate box
-                if committed_lines and any(
-                        _segment_intersects_rect(cl_a, cl_t, candidate)
-                        for cl_a, cl_t in committed_lines):
-                    row += 1
-                    y += grid_step_y
-                    continue
+                if line_grid.n:
+                    cross = False
+                    for li in line_grid.query(candidate):
+                        cl_a, cl_t = line_grid.segs[li]
+                        if _segment_intersects_rect(cl_a, cl_t, candidate):
+                            cross = True
+                            break
+                    if cross:
+                        row += 1
+                        y += grid_step_y
+                        continue
                 # Soft: prefer closeness to marker + hugging nearest page edge
                 leader_len = ((cax - marker_x) ** 2 + (cay - marker_y) ** 2) ** 0.5
                 edge_dist = min(
@@ -783,12 +942,14 @@ def place_callout_annotation(
                 )
                 # Crossing penalty: prefer fewer crossings even though they're not hard-rejected here
                 crossings = 0
-                if committed_lines:
-                    crossings = sum(
-                        1 for cl_a, cl_t in committed_lines
-                        if _segments_intersect(c_attach, c_tip, cl_a, cl_t)
-                    )
-                score = leader_len + edge_dist * 0.5 + crossings * page_diag * 2
+                if line_grid.n:
+                    for li in line_grid.query(seg_bbox):
+                        cl_a, cl_t = line_grid.segs[li]
+                        if _segments_intersect(c_attach, c_tip, cl_a, cl_t):
+                            crossings += 1
+                # Leader length dominates; edge bonus is small to discourage
+                # boxes drifting far from the marker just to hug the margin.
+                score = leader_len + edge_dist * 0.1 + crossings * page_diag * 2
                 clean_candidates.append((score, candidate))
                 row += 1
                 y += grid_step_y
