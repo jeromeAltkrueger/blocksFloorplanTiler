@@ -55,6 +55,37 @@ ANNOTATION_CONFIG = {
 }
 
 
+
+def parse_color(value):
+    """Parse a color value into a PyMuPDF (r, g, b) tuple with floats 0–1.
+
+    Accepts:
+      - Hex string: "#FF0000" or "#f00" (with or without '#')
+      - RGB list/tuple: [1.0, 0.0, 0.0] or [255, 0, 0]
+
+    Returns (r, g, b) floats 0–1, or None on failure.
+    """
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        r, g, b = value
+        if all(isinstance(v, (int, float)) for v in (r, g, b)):
+            # Auto-detect 0–255 vs 0–1 range
+            if any(v > 1.0 for v in (r, g, b)):
+                return (r / 255.0, g / 255.0, b / 255.0)
+            return (float(r), float(g), float(b))
+    if isinstance(value, str):
+        h = value.lstrip("#")
+        try:
+            if len(h) == 3:
+                h = h[0]*2 + h[1]*2 + h[2]*2
+            if len(h) == 6:
+                return (int(h[0:2], 16) / 255.0,
+                        int(h[2:4], 16) / 255.0,
+                        int(h[4:6], 16) / 255.0)
+        except ValueError:
+            pass
+    return None
+
+
 # ==========================================
 # COORDINATE TRANSFORMATION
 # ==========================================
@@ -1075,11 +1106,10 @@ def place_callout_annotation(
     else:
         tip = fitz.Point(marker_x, marker_y)
 
-    # ── Add the FreeText box (NO embedded callout) ───────────────────────────
-    # The leader line is drawn AFTER all boxes are placed, as a separate
-    # add_line_annot() call.  This guarantees lines render on top of every
-    # box fill in the resulting PDF / pixmap (annotations render in /Annots
-    # order, so later annotations paint over earlier ones).
+    # ── Add the FreeText callout (box + integrated leader line) ────────────────
+    # The leader line is embedded into the FreeText annotation via the
+    # ``callout`` parameter so that box, border and arrow form a single
+    # selectable / movable annotation unit in PDF viewers.
     annot = page.add_freetext_annot(
         best_rect,
         text,
@@ -1088,7 +1118,10 @@ def place_callout_annotation(
         fill_color=(1, 1, 0.667),       # light yellow box background
         text_color=(0, 0, 0),            # black text + border
         border_width=1.5,
+        callout=[tip, attach],
+        line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
     )
+    annot.update()
 
     placed_boxes.append(best_rect)
     logger.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
@@ -1409,8 +1442,17 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
 
             if geo_type == "Polygon":
                 config = ANNOTATION_CONFIG["polygon"].copy()
+                # Allow per-object color/opacity overrides from properties
+                parsed = parse_color(properties.get("color"))
+                if parsed:
+                    config["fill_color"] = parsed
+                if properties.get("fillOpacity") is not None:
+                    try:
+                        config["fill_opacity"] = float(properties["fillOpacity"])
+                    except (TypeError, ValueError):
+                        pass
                 overlay = obj.get("overlay") or properties.get("overlay")
-                logger.info(f"   config: fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}, overlay={overlay!r}")
+                logger.info(f"   config: fill_color={config['fill_color']}, fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}, overlay={overlay!r}")
                 draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects, polygon_rects, shared_shape=polygon_shape)
                 objects_drawn += 1
 
@@ -1515,18 +1557,10 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
             except Exception as e:
                 logger.error(f"❌ Failed to place callout '{callout_text}': {e}", exc_info=True)
 
-    # ── Draw leader lines as Line annotations (rendered ON TOP of all boxes) ─
+    # Leader lines are now embedded into their FreeText callout annotations
+    # (via the ``callout`` parameter), so no separate Line annotations needed.
     if leader_lines:
-        logger.info(f"Drawing {len(leader_lines)} leader line annotation(s)...")
-        for attach_pt, tip_pt in leader_lines:
-            try:
-                line_annot = page.add_line_annot(attach_pt, tip_pt)
-                line_annot.set_colors(stroke=(0, 0, 0))
-                line_annot.set_border(width=3.0)
-                line_annot.update()
-            except Exception as e:
-                logger.error(f"❌ Failed to draw leader line: {e}", exc_info=True)
-        logger.info(f"✅ {len(leader_lines)} leader line(s) drawn on top of callout boxes")
+        logger.info(f"✅ {len(leader_lines)} leader line(s) embedded into callout annotations")
 
     logger.info(f"\n{'=' * 80}")
     logger.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
