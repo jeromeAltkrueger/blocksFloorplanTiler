@@ -18,6 +18,12 @@ import httpx
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from PIL import Image, ImageChops
 
+
+class AnnotationInputError(ValueError):
+    """The input file or metadata cannot be annotated (not a PDF, corrupt
+    file, or metadata missing required fields).  The HTTP endpoint maps this
+    to a 422 response instead of uploading an unannotated file as success."""
+
 # ==========================================
 # PDF ANNOTATION CONFIGURATION
 # ==========================================
@@ -187,7 +193,8 @@ def detect_trim_offset(page: fitz.Page, metadata: Dict[str, Any]) -> Tuple[float
 
 
 def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any],
-                     trim_offset: Tuple[float, float] = (0.0, 0.0)) -> Tuple[float, float]:
+                     trim_offset: Tuple[float, float] = (0.0, 0.0),
+                     derotation_matrix=None) -> Tuple[float, float]:
     """
     Transform Leaflet CRS.Simple coordinates to PyMuPDF PDF coordinates.
 
@@ -195,6 +202,9 @@ def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any],
         leaflet_coords: [x, y] where x=lng (positive), y=lat (negative)
         metadata: Must contain 'max_zoom' and 'quality_settings.pdf_scale'
         trim_offset: (trim_left, trim_top) in pixels at pdf_scale resolution
+        derotation_matrix: Optional fitz.Matrix to transform from the rotated
+            page.rect space to the unrotated mediabox space.  Pass this when
+            the page has been temporarily derotated for annotation.
 
     Returns:
         (pdf_x, pdf_y) in PyMuPDF coordinate space (top-left origin, Y down)
@@ -208,6 +218,13 @@ def transform_coords(leaflet_coords: List[float], metadata: Dict[str, Any],
     pdf_x = (x * scale + trim_left) / pdf_scale
     pdf_y = (-y * scale + trim_top) / pdf_scale
 
+    # If the page was derotated, map from the original rotated coordinate
+    # space (which the image / Leaflet coordinates correspond to) into
+    # the unrotated coordinate space that the page now uses.
+    if derotation_matrix is not None:
+        pt = fitz.Point(pdf_x, pdf_y) * derotation_matrix
+        pdf_x, pdf_y = pt.x, pt.y
+
     return (pdf_x, pdf_y)
 
 
@@ -218,7 +235,8 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                        pending_callouts: List = None,
                        shape_rects: List = None,
                        polygon_rects: List = None,
-                       shared_shape=None) -> None:
+                       shared_shape=None,
+                       derotation_matrix=None) -> None:
     """
     Draw a filled polygon on the PDF page, optionally with centered overlay text.
 
@@ -242,7 +260,7 @@ def draw_polygon_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
     pdf_points = []
     for point in outer_ring:
         x, y = point[0], point[1]
-        x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
+        x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset, derotation_matrix)
         pdf_points.append(fitz.Point(x_pdf, y_pdf))
     logger.debug(f"  {len(pdf_points)} points transformed to PDF coords")
 
@@ -299,7 +317,8 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
                        overlay: str = None,
                        trim_offset: Tuple[float, float] = (0.0, 0.0),
                        pending_callouts: List = None,
-                       shape_rects: List = None) -> None:
+                       shape_rects: List = None,
+                       derotation_matrix=None) -> None:
     """
     Draw a circular marker (burned into content stream) on the PDF page.
 
@@ -321,7 +340,7 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
     logger.info(f"Drawing marker at [{x}, {y}]")
 
     # Convert to PDF coordinates
-    x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset)
+    x_pdf, y_pdf = transform_coords([x, y], metadata, trim_offset, derotation_matrix)
     radius = config["radius"]
 
     # Native PDF Circle annotation — selectable/movable in Acrobat
@@ -355,7 +374,8 @@ def draw_marker_on_pdf(page: fitz.Page, coordinates: List[float],
 def draw_square_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
                       metadata: Dict[str, Any], config: Dict[str, Any],
                       overlay: str = None,
-                      trim_offset: Tuple[float, float] = (0.0, 0.0)) -> None:
+                      trim_offset: Tuple[float, float] = (0.0, 0.0),
+                      derotation_matrix=None) -> None:
     """
     Draw a filled square/rectangle on the PDF page, optionally with centered overlay text.
 
@@ -366,13 +386,16 @@ def draw_square_on_pdf(page: fitz.Page, coordinates: List[List[List[float]]],
         config: Styling configuration
         overlay: Optional text to display at the polygon's centroid
         trim_offset: (trim_left, trim_top) whitespace offset in pixels
+        derotation_matrix: Optional derotation matrix for rotated pages
     """
     # Treat squares the same as polygons
-    draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset)
+    draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset,
+                        derotation_matrix=derotation_matrix)
 
 
 def draw_text_on_pdf(page: fitz.Page, position: List[float],
-                     text: str, config: Dict[str, Any]) -> None:
+                     text: str, config: Dict[str, Any],
+                     rotate: int = 0) -> None:
     """
     Draw text with background on the PDF page.
 
@@ -381,6 +404,9 @@ def draw_text_on_pdf(page: fitz.Page, position: List[float],
         position: [x, y] position in PDF coordinates
         text: Text content to draw
         config: Text styling configuration
+        rotate: Counter-rotation for pages annotated in derotated space
+            (pass the page's original /Rotate so text reads horizontally
+            after the rotation is restored).
     """
     x, y = position
     font_size = config["font_size"]
@@ -390,13 +416,20 @@ def draw_text_on_pdf(page: fitz.Page, position: List[float],
     text_width = len(text) * font_size * 0.6
     text_height = font_size
 
-    # Draw background rectangle
-    rect = fitz.Rect(
-        x - padding,
-        y - padding,
-        x + text_width + padding,
-        y + text_height + padding
-    )
+    # Background rectangle + baseline, oriented for the counter-rotation
+    if rotate == 90:
+        # Text runs upward in derotated space → horizontal after /Rotate=90
+        rect = fitz.Rect(x - padding, y - text_width - padding,
+                         x + text_height + padding, y + padding)
+        baseline = fitz.Point(x + font_size, y)
+    elif rotate == 270:
+        rect = fitz.Rect(x - text_height - padding, y - padding,
+                         x + padding, y + text_width + padding)
+        baseline = fitz.Point(x - font_size, y)
+    else:
+        rect = fitz.Rect(x - padding, y - padding,
+                         x + text_width + padding, y + text_height + padding)
+        baseline = fitz.Point(x, y + font_size)
 
     shape = page.new_shape()
     shape.draw_rect(rect)
@@ -408,10 +441,11 @@ def draw_text_on_pdf(page: fitz.Page, position: List[float],
 
     # Draw text
     page.insert_text(
-        fitz.Point(x, y + font_size),  # Baseline position
+        baseline,
         text,
         fontsize=font_size,
-        color=config["font_color"]
+        color=config["font_color"],
+        rotate=rotate
     )
 
 
@@ -581,6 +615,104 @@ class _SegmentGrid:
         return list(out)
 
 
+class _InkMap:
+    """Ink-density map of the page for content-aware callout placement.
+
+    The page is rendered once at low resolution (annotations excluded) and
+    reduced to a coarse grayscale grid; an integral image gives O(1) mean-ink
+    queries for any rect.  Placement uses this as a soft penalty so callout
+    boxes prefer empty paper over drawing linework, legends and title blocks.
+    """
+    __slots__ = ("cell_w", "cell_h", "gw", "gh", "integral")
+
+    def __init__(self, page: fitz.Page, target_cells: int = 300):
+        rect = page.rect
+        self.gw = max(8, min(target_cells, int(rect.width / 8)))
+        self.gh = max(8, int(self.gw * rect.height / rect.width))
+        self.cell_w = rect.width / self.gw
+        self.cell_h = rect.height / self.gh
+        # Render small (≤ ~1200 px wide is plenty), then downsample to the grid
+        # with area averaging so each cell holds its mean luminance.
+        scale = min(1.0, 1200.0 / max(rect.width, rect.height))
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, annots=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples).convert("L")
+        img = img.resize((self.gw, self.gh), Image.BOX)
+        lum = list(img.getdata())
+        img.close()
+        # Integral image of ink (0 = white paper, 1 = solid ink), padded row/col of 0
+        gw, gh = self.gw, self.gh
+        integral = [[0.0] * (gw + 1) for _ in range(gh + 1)]
+        for y in range(gh):
+            row_sum = 0.0
+            src = y * gw
+            prev = integral[y]
+            cur = integral[y + 1]
+            for x in range(gw):
+                row_sum += (255 - lum[src + x]) / 255.0
+                cur[x + 1] = prev[x + 1] + row_sum
+
+        self.integral = integral
+
+    def mean_ink(self, r: fitz.Rect) -> float:
+        """Mean ink density (0..1) of the cells covered by rect *r*."""
+        x0 = max(0, min(self.gw - 1, int(r.x0 / self.cell_w)))
+        x1 = max(x0 + 1, min(self.gw, int(r.x1 / self.cell_w) + 1))
+        y0 = max(0, min(self.gh - 1, int(r.y0 / self.cell_h)))
+        y1 = max(y0 + 1, min(self.gh, int(r.y1 / self.cell_h) + 1))
+        s = (self.integral[y1][x1] - self.integral[y0][x1]
+             - self.integral[y1][x0] + self.integral[y0][x0])
+        return s / ((x1 - x0) * (y1 - y0))
+
+
+def _repair_callout_cl(page: fitz.Page, annot: "fitz.Annot", rect: fitz.Rect,
+                       tip: fitz.Point, attach: fitz.Point,
+                       text: str, font_size: float,
+                       text_rotate: int = 0) -> "fitz.Annot":
+    """Work around a PyMuPDF 1.25.x bug: FreeText callout points (/CL) are
+    transformed to raw PDF space with the wrong sign of the mediabox x-origin,
+    while the box /Rect uses the correct transform.  On CAD PDFs with a
+    centered mediabox (x0 < 0 — the normal case for architectural plans) every
+    leader line therefore lands off-page and the arrows are invisible.
+
+    Strategy: read back the raw /CL the library actually wrote, compare its
+    tip x against the correct raw coordinate, and on mismatch recreate the
+    annotation with x-compensated callout points — the same buggy transform
+    then produces correct /CL, /Rect and appearance stream in one go.  No-op
+    on well-formed PDFs (origin 0) and on PyMuPDF versions with the fix."""
+    if page.rotation != 0:  # translation-only check; pages are derotated upstream
+        return annot
+    doc = page.parent
+    val = doc.xref_get_key(annot.xref, "CL")
+    if val[0] != "array":
+        return annot
+    try:
+        written_x = float(val[1].strip("[]").split()[0])
+    except (ValueError, IndexError):
+        return annot
+    expected_x = tip.x + page.cropbox.x0  # correct page→raw x translation
+    delta = expected_x - written_x
+    if abs(delta) <= 0.5:
+        return annot
+    logger.info(f"   🔧 /CL x off by {delta:.1f} pt (mediabox-origin bug) — "
+                f"recreating callout with compensated points")
+    page.delete_annot(annot)
+    annot = page.add_freetext_annot(
+        rect,
+        text,
+        fontsize=font_size,
+        fontname="hebo",
+        fill_color=(1, 1, 0.667),
+        text_color=(0, 0, 0),
+        border_width=1.5,
+        callout=[fitz.Point(tip.x + delta, tip.y),
+                 fitz.Point(attach.x + delta, attach.y)],
+        line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
+        rotate=text_rotate,
+    )
+    annot.update()
+    return annot
+
+
 def place_callout_annotation(
         page: fitz.Page,
         marker_x: float,
@@ -594,7 +726,9 @@ def place_callout_annotation(
         polygon_points: List[fitz.Point] = None,
         forbidden_rects: List[fitz.Rect] = None,
         committed_lines: List[Tuple[fitz.Point, fitz.Point]] = None,
-        marker_zones: List[fitz.Rect] = None) -> None:
+        marker_zones: List[fitz.Rect] = None,
+        ink_map: "_InkMap" = None,
+        text_rotate: int = 0) -> None:
     """
     Add a Callout FreeText annotation.
 
@@ -632,6 +766,12 @@ def place_callout_annotation(
 
     # ── Auto-size box width to text content ───────────────────────────────────
     # Measure natural single-line width, then decide how many lines to wrap into.
+    # FreeText wraps at spaces only — a single word longer than the box clips.
+    # Shrink the font just for this callout until the longest word fits the cap.
+    longest_word = max((len(w) for w in text.split()), default=len(text))
+    if longest_word * font_size * 0.65 + 10 > max_box_width:
+        font_size = max(6.0, (max_box_width - 10) / (0.65 * longest_word))
+        logger.info(f"   [sizing] long unbreakable word ({longest_word} chars) — font shrunk to {font_size:.1f}pt")
     CHAR_W = font_size * 0.65  # bold Helvetica avg char width
     natural_width = len(text) * CHAR_W + 10  # single-line width + padding
 
@@ -643,6 +783,8 @@ def place_callout_annotation(
         box_width = min(max_box_width, max(natural_width / 2 + 10, font_size * 6))
         if box_width > max_box_width:
             box_width = min(max_box_width, natural_width / 3 + 10)
+    # Wrapped width must still fit the longest single word on one line
+    box_width = max(box_width, min(max_box_width, longest_word * CHAR_W + 10))
     box_width = round(box_width)
 
     # ── Sizing diagnostics (inputs) ───────────────────────────────────────────
@@ -674,6 +816,14 @@ def place_callout_annotation(
     line_height = font_size * 1.35
     box_height = n_lines * line_height + padding * 2
     box_height = max(box_height, font_size + padding * 2)
+
+    # Pages annotated in derotated space get their /Rotate restored afterwards,
+    # which spins the annotation appearance with the page.  The text is
+    # counter-rotated via the annotation's rotate flag (text_rotate), and the
+    # geometric footprint here must be the swap of the visual box dims so the
+    # displayed box has the intended proportions.
+    if text_rotate in (90, 270):
+        box_width, box_height = box_height, box_width
 
     # Minimum distance from marker centre to the nearest box edge
     min_dist = marker_radius + gap
@@ -855,6 +1005,10 @@ def place_callout_annotation(
             # Distance dominates; clearance gives at most a 20% discount so
             # short leader lines win even against very-open distant slots.
             score = effective_dist - clearance_reward * effective_dist * 0.2
+            # Content-aware: covering drawing linework / legend / title block
+            # costs up to 8% of the page diagonal — empty paper wins.
+            if ink_map is not None:
+                score += ink_map.mean_ink(candidate) * page_diag * 0.08
 
             if score < best_score:
                 best_score = score
@@ -981,6 +1135,8 @@ def place_callout_annotation(
                 # Leader length dominates; edge bonus is small to discourage
                 # boxes drifting far from the marker just to hug the margin.
                 score = leader_len + edge_dist * 0.1 + crossings * page_diag * 2
+                if ink_map is not None:
+                    score += ink_map.mean_ink(candidate) * page_diag * 0.08
                 clean_candidates.append((score, candidate))
                 row += 1
                 y += grid_step_y
@@ -1120,8 +1276,11 @@ def place_callout_annotation(
         border_width=1.5,
         callout=[tip, attach],
         line_end=fitz.PDF_ANNOT_LE_OPEN_ARROW,
+        rotate=text_rotate,
     )
     annot.update()
+    annot = _repair_callout_cl(page, annot, best_rect, tip, attach, text, font_size,
+                               text_rotate=text_rotate)
 
     placed_boxes.append(best_rect)
     logger.info(f"✅ Callout placed at {best_rect} → tip ({marker_x:.1f}, {marker_y:.1f}), overlap={best_score:.0f}")
@@ -1288,28 +1447,47 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         metadata: Metadata containing coordinate system info
 
     Returns:
-        Annotated PDF as bytes (returns original bytes unmodified on failure)
+        Annotated PDF as bytes.
+
+    Raises:
+        AnnotationInputError: input is empty / not a PDF / corrupt, or the
+            metadata lacks the fields the coordinate transform needs.  The
+            endpoint maps this to a 422 so callers never receive an
+            unannotated file labelled as a successful export.
     """
-    # ── PDF header / size validation ─────────────────────────────────────────
+    # ── Input validation ─────────────────────────────────────────────────────
     logger.info(f"PDF bytes received: {len(pdf_bytes):,} bytes")
     if not pdf_bytes:
-        logger.error("PDF bytes are empty. Returning original.")
-        return pdf_bytes
+        raise AnnotationInputError("input file is empty")
     magic = pdf_bytes[:8]
     logger.info(f"PDF magic bytes: {magic!r}")
     if magic[:5] != b"%PDF-":
-        logger.error(f"Downloaded content is NOT a PDF ({len(pdf_bytes):,} bytes, magic={pdf_bytes[:20]!r}). Returning original.")
-        return pdf_bytes
+        raise AnnotationInputError(
+            f"input is not a PDF ({len(pdf_bytes):,} bytes, magic={pdf_bytes[:20]!r})")
     # Log PDF version string (e.g. b'%PDF-1.7')
     version_line = pdf_bytes[:20].split(b"\n")[0].strip()
     logger.info(f"PDF version header: {version_line!r}")
+
+    # ── Metadata validation ──────────────────────────────────────────────────
+    # Everything downstream (trim detection, coordinate transform) needs these;
+    # fail fast with a clear message instead of a KeyError deep in the pipeline.
+    try:
+        _ = int(metadata["source_image"]["width"])
+        _ = int(metadata["source_image"]["height"])
+        _ = int(metadata["max_zoom"])
+        _scale = float(metadata["quality_settings"]["pdf_scale"])
+    except (KeyError, TypeError, ValueError) as meta_err:
+        raise AnnotationInputError(
+            f"metadata is missing/invalid required fields "
+            f"(source_image.width/height, max_zoom, quality_settings.pdf_scale): {meta_err!r}")
+    if _scale <= 0:
+        raise AnnotationInputError(f"metadata quality_settings.pdf_scale must be > 0, got {_scale}")
 
     # ── Open PDF ──────────────────────────────────────────────────────────────
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     except Exception as open_err:
-        logger.error(f"fitz.open() raised an exception: {open_err!r} — PDF may be corrupt. Returning original.", exc_info=True)
-        return pdf_bytes
+        raise AnnotationInputError(f"PDF could not be opened (corrupt?): {open_err!r}")
 
     logger.info(f"fitz.open() succeeded")
     logger.info(f"  is_pdf       : {doc.is_pdf}")
@@ -1328,9 +1506,9 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         logger.warning("  metadata     : (could not read)")
 
     if not doc.is_pdf or doc.page_count == 0:
-        logger.error(f"fitz opened file but is_pdf={doc.is_pdf}, pages={doc.page_count}. Returning original.")
         doc.close()
-        return pdf_bytes
+        raise AnnotationInputError(
+            f"file opened but is not a usable PDF (is_pdf={doc.is_pdf}, pages={doc.page_count})")
 
     page = doc[0]  # First page
     logger.info(f"Page 0 info:")
@@ -1413,9 +1591,34 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logger.info(f"=" * 80)
 
     # Detect whitespace trim offset (needed when PDF had margins that were cropped)
+    # NOTE: must run BEFORE derotation so page.rect matches the rendered image orientation.
     trim_offset = detect_trim_offset(page, metadata)
     logger.info(f"Trim offset: left={trim_offset[0]:.1f}, top={trim_offset[1]:.1f} px")
     logger.info(f"=" * 80)
+
+    # ── Handle page rotation ─────────────────────────────────────────────────
+    # Many engineering/architectural PDFs carry a /Rotate attribute (90° or 270°)
+    # so the page is stored in portrait but displayed in landscape.
+    # The tile image was rendered via get_pixmap() which respects /Rotate, so
+    # the Leaflet coordinates correspond to the *rotated* visual space.
+    #
+    # PyMuPDF's annotation APIs (FreeText, Circle, Shape) have inconsistent
+    # rotation handling — FreeText text appears rotated and coordinates can
+    # land in wrong positions on rotated pages.
+    #
+    # Fix: temporarily remove /Rotate, transform all coordinates from the
+    # rotated visual space into the unrotated mediabox space using the
+    # derotation matrix, draw all annotations, then restore /Rotate.
+    # This guarantees text is horizontal and shapes are correctly positioned.
+    page_rotation = page.rotation
+    derotation_matrix = None
+    if page_rotation != 0:
+        derotation_matrix = page.derotation_matrix
+        page.set_rotation(0)
+        logger.info(f"Page has /Rotate={page_rotation}° — temporarily derotated for annotation")
+        logger.info(f"  Derotated page.rect: {page.rect}  ({page.rect.width:.1f} x {page.rect.height:.1f} pt)")
+    else:
+        logger.info(f"Page has no rotation — annotating directly")
 
     # Process each object
     # pending_callouts collects (x_pdf, y_pdf, radius, text) for markers with
@@ -1453,7 +1656,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                         pass
                 overlay = obj.get("overlay") or properties.get("overlay")
                 logger.info(f"   config: fill_color={config['fill_color']}, fill_opacity={config['fill_opacity']}, stroke_width={config['stroke_width']}, points={len(coordinates[0]) if coordinates else 0}, overlay={overlay!r}")
-                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects, polygon_rects, shared_shape=polygon_shape)
+                draw_polygon_on_pdf(page, coordinates, metadata, config, overlay, trim_offset, pending_callouts, shape_rects, polygon_rects, shared_shape=polygon_shape, derotation_matrix=derotation_matrix)
                 objects_drawn += 1
 
             elif geo_type == "Point" and obj_type == "text":
@@ -1462,7 +1665,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                                 or properties.get("label") or properties.get("overlay") or "")
                 logger.info(f"   TEXT FIELD: content={text_content!r}, coords={coordinates}")
                 if text_content:
-                    x_pdf, y_pdf = transform_coords(coordinates, metadata, trim_offset)
+                    x_pdf, y_pdf = transform_coords(coordinates, metadata, trim_offset, derotation_matrix)
                     logger.info(f"   TEXT FIELD -> PDF coords: ({x_pdf:.2f}, {y_pdf:.2f})")
                     text_config = ANNOTATION_CONFIG["text"].copy()
                     font_size_override = properties.get("fontSize")
@@ -1471,7 +1674,8 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                             text_config["font_size"] = float(font_size_override)
                         except (TypeError, ValueError):
                             pass
-                    draw_text_on_pdf(page, [x_pdf, y_pdf], text_content, text_config)
+                    draw_text_on_pdf(page, [x_pdf, y_pdf], text_content, text_config,
+                                     rotate=page_rotation)
                     logger.info(f"✅ Text field drawn: {text_content!r} at PDF ({x_pdf:.1f}, {y_pdf:.1f})")
                     objects_drawn += 1
                 else:
@@ -1482,7 +1686,7 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                 label = properties.get("content") or properties.get("label")
                 overlay = obj.get("overlay") or properties.get("overlay")
                 logger.info(f"   MARKER: label={label!r}, overlay={overlay!r}, coords={coordinates}")
-                draw_marker_on_pdf(page, coordinates, metadata, config, label, overlay, trim_offset, pending_callouts, shape_rects)
+                draw_marker_on_pdf(page, coordinates, metadata, config, label, overlay, trim_offset, pending_callouts, shape_rects, derotation_matrix=derotation_matrix)
                 objects_drawn += 1
 
             else:
@@ -1504,6 +1708,16 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     leader_lines: List[Tuple[fitz.Point, fitz.Point]] = []  # (attach, tip) pairs to render as Line annots
     if pending_callouts:
         logger.info(f"\nPlacing {len(pending_callouts)} callout annotation(s)...")
+
+        # Ink-density map for content-aware placement (soft penalty for boxes
+        # covering drawing linework / legend / title block).  Placement still
+        # works without it if the render fails for any reason.
+        ink_map = None
+        try:
+            ink_map = _InkMap(page)
+            logger.info(f"   Ink map built: {ink_map.gw}x{ink_map.gh} cells")
+        except Exception as ink_err:
+            logger.warning(f"   ⚠️  Ink map unavailable ({ink_err!r}) — placing without content awareness")
 
         # ── Sort callouts so spatially-adjacent markers are placed consecutively ─
         # Without this, placement order = arbitrary JSON input order, which causes
@@ -1550,6 +1764,8 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
                     forbidden_rects=polygon_rects,
                     committed_lines=committed_lines,
                     marker_zones=marker_zones,
+                    ink_map=ink_map,
+                    text_rotate=page_rotation,
                 )
                 if result:
                     leader_lines.append(result)
@@ -1566,39 +1782,38 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
     logger.info(f"COMPLETE: {objects_drawn}/{len(objects)} objects drawn, {len(pending_callouts)} callout(s) placed")
     logger.info(f"{'=' * 80}\n")
 
+    # ── Restore page rotation ────────────────────────────────────────────────
+    if page_rotation != 0:
+        page.set_rotation(page_rotation)
+        logger.info(f"Page rotation restored to {page_rotation}°")
+
     # ── Save annotated PDF ────────────────────────────────────────────────────
+    # NOTE: incremental save is impossible for stream-opened documents
+    # ("incremental needs original file") — don't attempt it.
     logger.info("Saving annotated PDF...")
     logger.info(f"  Input size      : {len(pdf_bytes):,} bytes")
-    output = io.BytesIO()
-
-    # Incremental save first (safe — only appends, never touches broken xrefs)
-    incremental_bytes = None
     try:
-        incremental_bytes = doc.tobytes(incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
-        logger.info(f"✅ Incremental save succeeded: {len(incremental_bytes):,} bytes "
-                     f"(+{len(incremental_bytes)-len(pdf_bytes):+,} bytes vs input)")
-    except Exception as inc_err:
-        logger.warning(f"⚠️  Incremental save failed: {inc_err!r}")
-
-    # Try clean save (smaller output, removes orphans)
-    try:
-        doc.save(output, garbage=3, deflate=True)
-        clean_bytes = output.getvalue()
+        output = io.BytesIO()
+        try:
+            doc.save(output, garbage=3, deflate=True)
+            clean_bytes = output.getvalue()
+            logger.info(f"✅ Clean save succeeded: {len(clean_bytes):,} bytes "
+                         f"(+{len(clean_bytes)-len(pdf_bytes):+,} bytes vs input)")
+            return clean_bytes
+        except Exception as save_err:
+            logger.warning(f"⚠️  Clean save failed: {save_err!r} — trying basic save")
+            try:
+                basic_bytes = doc.tobytes(deflate=True)
+                logger.info(f"✅ Basic save succeeded: {len(basic_bytes):,} bytes")
+                return basic_bytes
+            except Exception as basic_err:
+                # Propagate — the caller must NOT upload the unannotated
+                # original as if the export succeeded.
+                raise RuntimeError(
+                    f"could not save annotated PDF "
+                    f"(clean save: {save_err!r}; basic save: {basic_err!r})")
+    finally:
         doc.close()
-        logger.info(f"✅ Clean save succeeded: {len(clean_bytes):,} bytes "
-                     f"(+{len(clean_bytes)-len(pdf_bytes):+,} bytes vs input)")
-        return clean_bytes
-    except Exception as save_err:
-        logger.warning(f"⚠️  Clean save failed: {save_err!r}")
-
-    doc.close()
-
-    if incremental_bytes:
-        logger.info("Using incremental save as fallback.")
-        return incremental_bytes
-
-    logger.error("⚠️  Both save methods failed, returning original PDF unmodified")
-    return pdf_bytes
 
 
 # ==========================================
@@ -1701,7 +1916,20 @@ def register_routes(app: func.FunctionApp):
 
             # Annotate PDF
             logger.info("🎨 Annotating PDF...")
-            annotated_pdf_bytes = annotate_pdf(pdf_bytes, objects, metadata)
+            try:
+                annotated_pdf_bytes = annotate_pdf(pdf_bytes, objects, metadata)
+            except AnnotationInputError as input_err:
+                logger.error(f"❌ Unusable export input: {input_err}")
+                return func.HttpResponse(
+                    json.dumps({
+                        "success": False,
+                        "error": f"File cannot be exported: {input_err}",
+                        "error_type": "AnnotationInputError",
+                        "source_url": file_url
+                    }),
+                    status_code=422,
+                    mimetype="application/json"
+                )
             logger.info(f"✅ PDF annotated: {len(annotated_pdf_bytes)} bytes")
 
             # Generate filename with timestamp
@@ -1741,8 +1969,10 @@ def register_routes(app: func.FunctionApp):
                 content_settings=ContentSettings(content_type="application/pdf")
             )
 
-            # Generate the public URL
-            annotated_pdf_url = f"https://blocksplayground.blob.core.windows.net/{container_name}/{annotated_filename}"
+            # Public URL of the uploaded blob — derived from the client so it
+            # is correct for whichever storage account the connection string
+            # points at (playground, production, ...).
+            annotated_pdf_url = blob_client.url
 
             logger.info(f"✅ Upload complete!")
             logger.info(f"   URL: {annotated_pdf_url}")
