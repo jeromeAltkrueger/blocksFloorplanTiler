@@ -1590,6 +1590,24 @@ def annotate_pdf(pdf_bytes: bytes, objects: List[Dict[str, Any]],
         )
     logger.info(f"=" * 80)
 
+    # ── Guard: source PDF replaced/re-plotted after tiling ────────────────────
+    # If the page dimensions disagree with the tiled image by the SAME ratio in
+    # both axes, the sheet was re-plotted at a slightly different scale after
+    # the tiles were generated (uniform mismatch cannot come from whitespace
+    # trimming, which is additive per edge).  Without correction every object
+    # lands shifted toward the top-left, growing with distance from the origin.
+    # Recover the effective scale as image px / page pt.
+    _scale_meta = float(metadata["quality_settings"]["pdf_scale"])
+    _rw = page.rect.width * _scale_meta / img_w
+    _rh = page.rect.height * _scale_meta / img_h
+    if abs(_rw / _rh - 1.0) < 0.005 and abs(_rw - 1.0) > 0.005:
+        eff_scale = ((img_w / page.rect.width) * (img_h / page.rect.height)) ** 0.5
+        logger.warning(
+            f"⚠️  Page size vs tiled image mismatch by uniform ratio {_rw:.4f} — "
+            f"source PDF differs from the tiled version. Correcting pdf_scale "
+            f"{_scale_meta:.4f} → {eff_scale:.4f} (tiles/metadata should be regenerated).")
+        metadata["quality_settings"]["pdf_scale"] = eff_scale
+
     # Detect whitespace trim offset (needed when PDF had margins that were cropped)
     # NOTE: must run BEFORE derotation so page.rect matches the rendered image orientation.
     trim_offset = detect_trim_offset(page, metadata)
